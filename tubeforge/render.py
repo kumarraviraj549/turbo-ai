@@ -19,6 +19,8 @@ from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFo
 from . import cinema
 
 LATIN_FONTS = [
+    r"C:\Windows\Fonts\arialbd.ttf",
+    r"C:\Windows\Fonts\segoeuib.ttf",
     "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
     "/System/Library/Fonts/Helvetica.ttc",
     "/Library/Fonts/Arial Bold.ttf",
@@ -26,19 +28,37 @@ LATIN_FONTS = [
     "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
 ]
 SERIF_FONTS = [
+    r"C:\Windows\Fonts\georgiab.ttf",
+    r"C:\Windows\Fonts\timesbd.ttf",
     "/System/Library/Fonts/Supplemental/Georgia Bold.ttf",
     "/System/Library/Fonts/Supplemental/Times New Roman Bold.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
     "/usr/share/fonts/truetype/noto/NotoSerif-Bold.ttf",
 ]
-UNICODE_FONTS = ["/Library/Fonts/Arial Unicode.ttf", "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"]
-DEVANAGARI_FONTS = ["/System/Library/Fonts/Kohinoor.ttc", "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf"]
-CJK_FONTS = ["/System/Library/Fonts/Hiragino Sans GB.ttc", "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"]
+UNICODE_FONTS = [
+    r"C:\Windows\Fonts\arial.ttf",
+    "/Library/Fonts/Arial Unicode.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+]
+DEVANAGARI_FONTS = [
+    r"C:\Windows\Fonts\Nirmala.ttc",
+    "/System/Library/Fonts/Kohinoor.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf",
+]
+CJK_FONTS = [
+    r"C:\Windows\Fonts\msyhbd.ttc",
+    r"C:\Windows\Fonts\msyh.ttc",
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+]
 _font_cache: Dict[tuple, ImageFont.FreeTypeFont] = {}
 
 
 class RenderError(RuntimeError):
     pass
+
+
+PIPELINE_VERSION = "lossless-assembly-v1"
 
 
 class Cancelled(RuntimeError):
@@ -65,7 +85,7 @@ def load_font(size: int, text: str = "", serif: bool = False) -> ImageFont.FreeT
                 return f
             except Exception:
                 continue
-    return ImageFont.load_default()
+    return ImageFont.load_default(size=size)
 
 
 # ----------------------------------------------------------------------------------------------- camera
@@ -443,7 +463,8 @@ def _layout_words(words: List[str], font, max_w: int, space: int) -> List[List[T
 def render_caption_png(words: List[str], style: str, W: int, H: int, active: int = -1) -> Tuple[Image.Image, int, int]:
     """Returns (RGBA image, x, y) for a caption chunk. active = index of highlighted word (-1 none)."""
     bold = style in ("Bold Social", "Karaoke")
-    size = int(min(W, H) * (0.072 if style == "Bold Social" else 0.05 if style != "Minimal" else 0.036))
+    min_dim = min(W, H)
+    size = max(42, int(min_dim * (0.095 if style == "Bold Social" else 0.075 if style != "Minimal" else 0.065)))
     text_all = " ".join(words)
     font = load_font(size, text_all, serif=(style == "Cinematic"))
     disp = [w.upper() for w in words] if style == "Bold Social" else list(words)
@@ -929,7 +950,7 @@ def _run_ffmpeg(cmd: List[str], should_cancel: Optional[Callable[[], bool]] = No
 
 
 def _xfade_group(clips: List[Path], durs: List[float], trans: List[Tuple[str, float]], out: Path, fps: int,
-                 crf: int, preset: str, size: Optional[Tuple[int, int]] = None,
+                 size: Optional[Tuple[int, int]] = None,
                  should_cancel: Optional[Callable[[], bool]] = None) -> float:
     if len(clips) == 1 and size is None:
         if should_cancel and should_cancel():
@@ -958,7 +979,7 @@ def _xfade_group(clips: List[Path], durs: List[float], trans: List[Tuple[str, fl
         acc = off + durs[i]
     segs.append(f"{prev}format=yuv420p[vout]")
     cmd = ["ffmpeg", "-y", "-v", "error", *inputs, "-filter_complex", ";".join(segs), "-map", "[vout]", "-c:v",
-           "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p", "-r", str(fps), str(out)]
+           "ffv1", "-level", "3", "-pix_fmt", "yuv420p", "-r", str(fps), str(out)]
     res = _run_ffmpeg(cmd, should_cancel)
     if res.returncode != 0:
         if (should_cancel and should_cancel()) or _ffmpeg_interrupted(res.stderr):
@@ -984,9 +1005,8 @@ def assemble_video(clips: List[Path], durations: List[float], transitions: List[
             cl = level_clips[gi: gi + group]
             du = level_durs[gi: gi + group]
             tr = level_trans[gi: gi + len(cl) - 1]
-            outp = work / f"_asm_L{level}_{gi // group:03d}.mp4"
-            d = _xfade_group(cl, du, tr, outp, fps, 14, "veryfast", size if level == 0 else None,
-                             should_cancel)
+            outp = work / f"_asm_L{level}_{gi // group:03d}.mkv"
+            d = _xfade_group(cl, du, tr, outp, fps, size if level == 0 else None, should_cancel)
             nxt_clips.append(outp)
             nxt_durs.append(d)
             if gi + group < len(level_clips):
@@ -1138,36 +1158,66 @@ def render_end_card_png(title: str, W: int, H: int, channel_name: str = "", logo
     img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     m = min(W, H)
-    small = load_font(int(m * 0.032), "THANKS FOR WATCHING")
     head = "THANKS FOR WATCHING"
     spaced = " ".join(head)
-    d.text(((W - small.getlength(spaced)) / 2, H * 0.24), spaced, font=small, fill=(255, 255, 255, 200))
+    small_size = max(28, int(m * 0.045))
+    small = load_font(small_size, spaced)
+    while small.getlength(spaced) > W * 0.86 and small_size > 28:
+        small_size = max(28, int(small_size * 0.9))
+        small = load_font(small_size, spaced)
+    d.text(((W - small.getlength(spaced)) / 2, H * 0.16), spaced, font=small, fill=(255, 255, 255, 220))
     ttl, _, _ = render_title_png(title or "The End", "Title", W, H, accent)
-    img.alpha_composite(ttl, ((W - ttl.width) // 2, int(H * 0.40 - ttl.height / 2)))
-    y = int(H * 0.60)
-    if channel_name.strip() or (logo_path and Path(logo_path).exists()):
-        bs = int(m * 0.15)
-        badge = build_circular_logo_badge(logo_path, channel_name, bs)
-        f2 = load_font(int(m * 0.04), channel_name)
-        name = channel_name.strip()
-        nw = int(f2.getlength(name)) if name else 0
-        bf = load_font(int(m * 0.036), "SUBSCRIBE")
-        bt = "SUBSCRIBE"
-        bw, bh = int(bf.getlength(bt) + m * 0.07), int(m * 0.075)
-        total = bs + int(m * 0.03) + max(nw, bw)
+    img.alpha_composite(ttl, ((W - ttl.width) // 2, int(H * 0.34 - ttl.height / 2)))
+    name = channel_name.strip()
+    has_brand = bool(name) or bool(logo_path and Path(logo_path).exists())
+    y = int(H * 0.54)
+    if has_brand:
+        bs = max(96, int(m * 0.13))
+        badge = build_circular_logo_badge(logo_path, name, bs)
+        font_size = max(30, int(m * 0.05))
+        f2 = load_font(font_size, name) if name else None
+        max_name_w = int(W * 0.66)
+        while f2 and f2.getlength(name) > max_name_w and font_size > 30:
+            font_size = max(30, int(font_size * 0.9))
+            f2 = load_font(font_size, name)
+        nw = int(f2.getlength(name)) if f2 else 0
+        gap = int(m * 0.03)
+        total = bs + gap + nw
         x0 = (W - total) // 2
         img.alpha_composite(badge.convert("RGBA").resize((bs, bs)), (x0, y))
-        tx = x0 + bs + int(m * 0.03)
-        if name:
-            d.text((tx, y - int(m * 0.004)), name, font=f2, fill=(255, 255, 255, 255))
-        by = y + int(m * 0.065)
-        d.rounded_rectangle([tx, by, tx + bw, by + bh], radius=bh // 5, fill=(230, 33, 23, 255))
-        d.text((tx + (bw - bf.getlength(bt)) / 2, by + (bh - bf.size) / 2 - bf.size * 0.12), bt, font=bf,
-               fill=(255, 255, 255, 255))
-        y += bs + int(m * 0.05)
+        if f2:
+            tx = x0 + bs + gap
+            bbox = f2.getbbox(name)
+            th = bbox[3] - bbox[1]
+            d.text((tx, y + (bs - th) // 2 - bbox[1]), name, font=f2, fill=(255, 255, 255, 255))
+        y += bs + int(m * 0.025)
+    else:
+        y = int(H * 0.59)
+
+    bt = "SUBSCRIBE"
+    bf = load_font(max(40, int(m * 0.06)), bt)
+    pad_x = int(m * 0.08)
+    bw = max(int(bf.getlength(bt) + pad_x * 2), int(W * 0.26))
+    bh = max(int(m * 0.095), int(bf.size * 1.5))
+    bx = (W - bw) // 2
+    d.rounded_rectangle([bx, y, bx + bw, y + bh], radius=bh // 3, fill=(230, 33, 23, 255))
+    bbox = bf.getbbox(bt)
+    text_h = bbox[3] - bbox[1]
+    d.text((bx + (bw - bf.getlength(bt)) / 2, y + (bh - text_h) / 2 - bbox[1]), bt, font=bf,
+           fill=(255, 255, 255, 255))
+    y += bh + int(m * 0.035)
+
     cta = cta.strip() or "Like  •  Share  •  Comment what happens next"
-    f3 = load_font(int(m * 0.03), cta)
-    d.text(((W - f3.getlength(cta)) / 2, y), cta, font=f3, fill=(255, 255, 255, 215))
+    f3 = load_font(max(30, int(m * 0.04)), cta)
+    cta_lines = _layout_words(cta.split(), f3, int(W * 0.86), int(f3.getlength(" ")))
+    asc, desc = f3.getmetrics()
+    line_height = int((asc + desc) * 1.15)
+    max_y = H - line_height * len(cta_lines) - int(m * 0.04)
+    y = min(y, max_y)
+    for i, line in enumerate(cta_lines):
+        line_text = " ".join(word for word, _ in line)
+        d.text(((W - f3.getlength(line_text)) / 2, y + i * line_height), line_text, font=f3,
+               fill=(255, 255, 255, 235), stroke_width=max(1, f3.size // 22), stroke_fill=(0, 0, 0, 200))
     return img
 
 

@@ -80,6 +80,21 @@ def record_usage(provider: str, neurons: float = 0.0, usd: float = 0.0) -> None:
         USAGE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
+def reserve_cloudflare_neurons(neurons: float, limit: float = CLOUDFLARE_FREE_NEURONS) -> bool:
+    """Conservatively reserve free-tier image-generation usage before making a provider request."""
+    if neurons <= 0:
+        return True
+    with _usage_lock:
+        data = _read_usage()
+        used = float(data.get("cloudflare_neurons", 0.0))
+        if used + neurons > limit:
+            return False
+        data["cloudflare_neurons"] = used + neurons
+        OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+        USAGE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        return True
+
+
 def usage_today() -> dict:
     with _usage_lock:
         return _read_usage()

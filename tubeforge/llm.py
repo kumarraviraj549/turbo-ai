@@ -30,12 +30,9 @@ OPENROUTER_FREE_PREFERENCE = [
 ]
 
 TASK_ORDER = {
-    # Storytelling, treatments and cinematic writing: OpenRouter first (best creative models).
-    "creative": ["openrouter", "gemini", "groq", "cloudflare"],
-    # Scene breakdown / prompt engineering: Groq first (fastest inference).
-    "scenes": ["groq", "gemini", "cloudflare", "openrouter"],
-    # Short structured helpers (auto settings, prompt enhancement): Groq first.
-    "fast": ["groq", "cloudflare", "gemini", "openrouter"],
+    "creative": ["openrouter", "groq"],
+    "scenes": ["groq", "openrouter"],
+    "fast": ["groq", "openrouter"],
 }
 
 _openrouter_models_lock = threading.Lock()
@@ -206,13 +203,9 @@ def _backend_models(provider: str, preferred_openrouter: str = "") -> List[str]:
         if not config.openrouter_key():
             return []
         models = openrouter_free_chain()
-        if preferred_openrouter:
+        if preferred_openrouter.endswith(":free"):
             models = [preferred_openrouter] + [m for m in models if m != preferred_openrouter]
         return models
-    if provider == "gemini":
-        return GEMINI_MODELS if config.gemini_key() else []
-    if provider == "cloudflare":
-        return CF_MODELS if (config.cloudflare_token() and config.cloudflare_account()) else []
     return []
 
 
@@ -225,7 +218,7 @@ _CALLERS = {
 
 
 def available_backends() -> List[str]:
-    return [p for p in ("groq", "openrouter", "gemini", "cloudflare") if _backend_models(p)]
+    return [p for p in ("groq", "openrouter") if _backend_models(p)]
 
 
 def complete_json(

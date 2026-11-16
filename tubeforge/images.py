@@ -50,7 +50,8 @@ ENGINES: Dict[str, ImageEngine] = {e.key: e for e in [
     ImageEngine("pixabay", "Pixabay stock photo (real photo, keyword match)", "pixabay", "stock"),
 ]}
 
-AUTO_ORDER = ["cf_klein4b", "cf_klein9b", "openrouter", "gemini", "pollinations_key", "pollinations_free", "pixabay"]
+FREE_ENGINE_KEYS = {"cf_klein4b", "pollinations_free", "pixabay"}
+AUTO_ORDER = ["cf_klein4b", "pollinations_free", "pixabay"]
 OPENROUTER_DEFAULT_IMAGE_MODEL = "black-forest-labs/flux.2-klein-4b"
 GEMINI_IMAGE_MODELS = ["gemini-3.1-flash-image", "gemini-2.5-flash-image", "gemini-3.1-flash-lite-image"]
 
@@ -347,14 +348,14 @@ def generate_image(
     log: Optional[Callable[[str], None]] = None,
 ) -> ImageResult:
     """Generates one image and saves it (fitted to width x height) as JPEG at out_path."""
+    if engine != "auto" and engine not in FREE_ENGINE_KEYS:
+        raise ImageGenError(f"{engine!r} is not enabled in free-tier-only mode")
     seed = random.randint(1, 2 ** 31 - 1) if seed is None else int(seed)
     refs = [Path(r) for r in (refs or []) if r and Path(r).exists()]
     if engine == "auto":
-        order = [e for e in AUTO_ORDER if (allow_paid or ENGINES[e].tier != "paid")
-                 and (allow_stock or ENGINES[e].tier != "stock")]
+        order = [e for e in AUTO_ORDER if (allow_stock or ENGINES[e].tier != "stock")]
     else:
-        order = [engine] + [e for e in AUTO_ORDER if e != engine and (allow_paid or ENGINES[e].tier != "paid")
-                            and (allow_stock or ENGINES[e].tier != "stock")]
+        order = [engine] + [e for e in AUTO_ORDER if e != engine and (allow_stock or ENGINES[e].tier != "stock")]
     full_prompt = prompt.strip()
     if negative and not ENGINES.get(engine, ENGINES["cf_klein4b"]).negative:
         # Models without negative prompt support get the exclusions phrased positively.
@@ -378,16 +379,18 @@ def generate_image(
             if cached:
                 data = cached
             elif name in ("cf_klein4b", "cf_klein9b", "cf_flux2dev"):
+                if name != "cf_klein4b":
+                    raise ProviderError("cloudflare", f"{name} is not enabled in free-tier-only mode")
                 model = {"cf_klein4b": "flux-2-klein-4b", "cf_klein9b": "flux-2-klein-9b",
                          "cf_flux2dev": "flux-2-dev"}[name]
+                neurons = max(300.0, estimate_neurons(name, gw, gh, len(use_refs)))
+                if not cache.reserve_cloudflare_neurons(neurons):
+                    raise ProviderError("cloudflare", "daily free neuron budget would be exceeded")
                 data = _cf_flux2(model, full_prompt, gw, gh, seed, use_refs, steps=25 if name == "cf_flux2dev" else 0)
-                neurons = estimate_neurons(name, gw, gh, len(use_refs), 25)
             elif name == "cf_lucid":
-                data = _cf_lucid(full_prompt, gw, gh, seed)
-                neurons = estimate_neurons(name, gw, gh)
+                raise ProviderError("cloudflare", "cf_lucid is not enabled in free-tier-only mode")
             elif name == "cf_phoenix":
-                data = _cf_phoenix(prompt, negative, gw, gh, seed)
-                neurons = estimate_neurons(name, gw, gh)
+                raise ProviderError("cloudflare", "cf_phoenix is not enabled in free-tier-only mode")
             elif name == "openrouter":
                 model = openrouter_model or OPENROUTER_DEFAULT_IMAGE_MODEL
                 data = _openrouter_image(full_prompt, gw, gh, seed, use_refs, model)
@@ -420,7 +423,7 @@ def generate_image(
         if not cached:
             cache.put_bytes("img", ck, ".jpg", data)
             if neurons:
-                cache.record_usage("cloudflare", neurons=neurons)
+                cache.record_usage("cloudflare")
             else:
                 cache.record_usage(ENGINES[name].provider)
         out_path = Path(out_path)

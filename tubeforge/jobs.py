@@ -18,7 +18,7 @@ import zipfile
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from . import audio, cinema, images, planner, render, tts, video
+from . import audio, cinema, images, planner, quality, render, tts, video
 from .config import STUDIO_ROOT
 
 LEAD_IN = 0.35
@@ -35,9 +35,10 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "dialogue_voices": True, "character_voices": {},
     "music_mood": "ambient", "music_path": "", "music_vol": 0.35, "voice_vol": 1.0, "fx_vol": 0.5, "duck": 0.6,
     "ambience_on": True, "sfx_on": True, "loudness": -14.0,
-    "image_engine": "auto", "openrouter_image_model": "", "allow_paid": False, "allow_stock": True,
-    "default_source": "ai_image", "negative_global": "blurry, low quality, distorted, deformed, watermark, text, logo",
+    "image_engine": "auto", "openrouter_image_model": "", "allow_paid": False, "allow_stock": False,
+    "default_source": "original_motion", "negative_global": "blurry, low quality, distorted, deformed, watermark, text, logo",
     "char_refs": {}, "ai_video_model": "", "ai_video_res": "720p", "ai_video_budget": 0.0,
+    "research_notes": "",
     "channel_name": "", "channel_logo_path": "", "brand_position": "Top-Right",
     "voice_branding": True, "brand_overlay": True, "target_duration": 120.0,
     "fade_in": 0.6, "fade_out": 1.2, "workers": 3, "seed": 0, "title_card": True,
@@ -381,43 +382,10 @@ def ensure_visual(p: Project, sc: planner.Scene, log: Callable[[str], None],
         log(f"⚠️ No stock footage for “{sc.stock_query}”, using an AI image for scene “{sc.title}”")
         src = "ai_image"
     if src == "ai_video":
-        img = ensure_image(p, sc, log)
-        out = p.scene_dir(sc.id) / "ai.mp4"
-        model = s.get("ai_video_model") or ""
-        ar = aspect_ratio_str(s)
-        want = sc.duration + 1.0
-        fp = _fp("aiv", sc.video_prompt, _file_sig(str(img)), model, s["ai_video_res"], ar, want)
-        if st.get("ai_video_fp") == fp and out.exists():
-            return "video", out
-        try:
-            if not model:
-                cands = video.compatible_models(want, s["ai_video_res"], ar, True)
-                if not cands:
-                    raise video.VideoGenError(f"no OpenRouter video model supports {ar} at {s['ai_video_res']}")
-                model = cands[0]["id"]
-            info = video.model_info(model)
-            params = video.pick_params(info, want, s["ai_video_res"], ar) if info else {}
-            est = video.estimate_cost(info, params.get("duration", want), params.get("resolution", s["ai_video_res"])) \
-                if info else None
-            budget = float(s.get("ai_video_budget") or 0)
-            spent = float(p.data.get("spent_usd") or 0)
-            if est is not None and budget > 0 and spent + est > budget:
-                raise video.VideoGenError(f"budget guard: ${spent + est:.2f} would exceed the ${budget:.2f} limit")
-            log(f"🎥 AI video for “{sc.title}” via {model} (est. ${est if est is not None else '?'})")
-            res = video.generate_ai_clip(sc.video_prompt, out, model, want, s["ai_video_res"], ar, first_frame=img,
-                                         seed=st.get("seed"), log=log, should_cancel=should_cancel)
-            with p.lock:
-                p.data["spent_usd"] = float(p.data.get("spent_usd") or 0) + float(res.get("usd") or 0)
-                st.update(ai_video_fp=fp, ai_video=str(out), ai_video_model=model, ai_video_usd=res.get("usd"))
-            return "video", out
-        except Exception as e:  # noqa: BLE001 - fall back to animated still, and say so
-            if should_cancel():
-                raise
-            msg = f"AI video failed for “{sc.title}” ({str(e)[:160]}); animating the AI image instead"
-            log(f"⚠️ {msg}")
-            with p.lock:
-                st["ai_video_error"] = str(e)[:300]
-            return "image", img
+        log(f"🎥 Hosted AI video is disabled in free-tier-only mode for “{sc.title}”; using original local motion")
+        src = "original_motion"
+    if src == "original_motion":
+        return "image", ensure_image(p, sc, log)
     return "image", ensure_image(p, sc, log)
 
 
@@ -432,7 +400,9 @@ def ensure_voice(p: Project, sc: planner.Scene, log: Callable[[str], None]) -> L
     out_parts, cursor = [], 0.0
     for i, (text, voice_id) in enumerate(parts):
         path = p.scene_dir(sc.id) / f"voice_{i}.mp3"
-        engine = s["voice_engine"] if voice_id == s["voice"] else "edge"
+        engine = "edge"
+        edge_voices = {v for v, _ in tts.voice_options(s["language"])}
+        voice_id = voice_id if voice_id in edge_voices else tts.voice_options(s["language"])[0][0]
         res = tts.synthesize(text, path, engine=engine, voice=voice_id, speed=s["voice_speed"],
                              pitch_hz=int(s["voice_pitch"]), emotion=sc.emotion, log=log)
         out_parts.append({"path": str(path), "offset": cursor, "duration": res.duration, "voice": res.voice,
@@ -475,6 +445,8 @@ def render_spec(p: Project, sc: planner.Scene, idx: int, kind: str, src: Path, c
     atmo = sc.atmosphere if s.get("atmosphere", "auto") == "auto" else s["atmosphere"]
     overlay = sc.overlay_text if (idx > 0 or s.get("title_card", True) or sc.overlay_kind != "Title") else ""
     anim = sc.animation
+    if sc.source == "original_motion" and anim == "None":
+        anim = "Parallax depth"
     return render.SceneRenderSpec(
         out_path=p.scene_dir(sc.id) / "clip.mp4", width=W, height=H, fps=int(s["fps"]), duration=clip_len,
         source_type=kind, source_path=src, camera=sc.camera_move, intensity=float(s["camera_intensity"]),
@@ -500,7 +472,7 @@ def spec_fingerprint(spec: render.SceneRenderSpec) -> str:
          if k not in ("out_path", "work_dir", "caption_chunks")}
     d["src"] = _file_sig(str(spec.source_path))
     d["captions"] = [(round(c.start, 2), round(c.end, 2), c.words) for c in spec.caption_chunks]
-    return _fp("clip", d, render.__name__)
+    return _fp("clip", d, render.__name__, render.PIPELINE_VERSION)
 
 
 # ---------------------------------------------------------------------------------------------- jobs
@@ -635,6 +607,14 @@ def run_plan(p: Project, ev: threading.Event, script: str = "", extra: str = "",
     if target_sec <= 0:
         target_sec = float(s.get("scene_count", 8)) * float(s.get("scene_duration", 6.0))
     target_min = target_sec / 60.0
+    research_notes = str(s.get("research_notes", "")).strip()
+    if research_notes:
+        extra += (
+            "\nFACTUAL SOURCES AND RESEARCH NOTES (user supplied; do not claim to have opened these links):\n"
+            f"{research_notes[:5000]}\n"
+            "Use only supported facts from these notes, preserve uncertainty, do not invent citations or precise "
+            "claims, and do not present unsourced details as verified."
+        )
     plan = planner.generate_plan(p.data["idea"], s["style"], int(s["scene_count"]), float(s["scene_duration"]),
                                  s["language"], s.get("tone", ""), s.get("audience", ""), script, extra,
                                  log=p.log, progress=prog,
@@ -642,8 +622,11 @@ def run_plan(p: Project, ev: threading.Event, script: str = "", extra: str = "",
                                  voice_branding=bool(s.get("voice_branding", True)),
                                  target_minutes=target_min)
     for sc in plan.scenes:
-        if sc.source == "ai_image" and s.get("default_source") in ("stock_video", "ai_video"):
+        if sc.source == "ai_image" and s.get("default_source") in ("original_motion", "stock_video"):
             sc.source = s["default_source"]
+        elif sc.source == "ai_video":
+            sc.source = "original_motion"
+    plan.research_sources = [line.strip() for line in research_notes.splitlines() if line.strip()]
     p.set_plan(plan)
     with p.lock:
         p.data["outputs"] = {}
@@ -751,6 +734,14 @@ def produce(p: Project, ev: threading.Event, scene_ids: Optional[List[str]], ass
     if failed:
         raise RuntimeError(f"{len(failed)} scene(s) failed: {', '.join(failed[:5])}. Fix or retry them, then render "
                            "again (finished scenes are reused).")
+    qa = quality.inspect_project(plan, p.data.get("scene_state") or {}, p.settings.get("char_refs") or {},
+                                 render_size(p.settings)[:2])
+    with p.lock:
+        p.data["visual_qa"] = qa
+    for issue in qa["issues"]:
+        p.log(f"⚠️ Visual QA: {issue}")
+    if not qa["issues"]:
+        p.log(f"✅ Visual QA passed for {qa['checked_scenes']} generated stills")
     if assemble:
         assemble_film(p, ev)
     p.save()
@@ -829,7 +820,7 @@ def assemble_film(p: Project, ev: threading.Event) -> None:
             raise Cancelled()
 
     stage(f"🎞️ Assembling {len(clips)} clips with transitions ({total:.1f}s)", 0.86)
-    silent = work / "assembled.mp4"
+    silent = work / "assembled.mkv"
     RW, RH, _ = render_size(s)
     render.assemble_video(clips, durs, trans, silent, int(s["fps"]), work, size=(RW, RH),
                           should_cancel=ev.is_set)
@@ -928,7 +919,10 @@ def assemble_film(p: Project, ev: threading.Event) -> None:
             p.log(f"⚠️ Shorts teaser skipped: {e}")
     chapters = _chapters(plan, starts, total)
     credits = [p.state(sc.id).get("stock_credit") for sc in scenes if p.state(sc.id).get("stock_credit")]
+    sources = [line for line in plan.research_sources if line.strip()]
+    source_text = "\n\nSources / fact-check notes:\n" + "\n".join(sources) if sources else ""
     desc = (plan.youtube_description + ("\n\n" + "\n".join(f"{_ts(t)} {name}" for t, name in chapters) if chapters else "")
+            + source_text
             + (f"\n\nStock footage: {'; '.join(dict.fromkeys(credits))} (Pixabay License)" if credits else "")
             + "\n\n" + " ".join("#" + re.sub(r"\W", "", t) for t in plan.tags[:8]))
     meta = out_dir / "youtube_metadata.txt"

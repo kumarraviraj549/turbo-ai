@@ -60,7 +60,9 @@ STEPS = ["Idea", "Story", "Characters", "Scenes", "Visuals", "Voice", "Music", "
 STATUS_ICON = {"pending": "⏳", "visual": "🖼️", "voice": "🎙️", "rendering": "🎬", "done": "✅", "error": "❌",
                "cancelled": "⏹️", "assets": "📦"}
 SOURCES = {"ai_image": "AI image + camera move", "stock_video": "Stock footage (Pixabay)",
-           "ai_video": "AI video (OpenRouter, paid)", "upload": "My upload"}
+           "original_motion": "Original AI scene + free local motion",
+           "ai_video": "Hosted AI video (disabled in free mode)", "upload": "My upload"}
+FREE_SOURCES = ["original_motion", "ai_image", "stock_video", "upload"]
 DURATION_PRESETS = [
     ("⚡ 30s Short (Fast Hook)", 30.0, 4),
     ("⏱️ 1 Minute (60s Quick Story)", 60.0, 8),
@@ -211,6 +213,19 @@ def _save_upload(p: jobs.Project, up, sub: str, name: str) -> str:
 def _fmt_time(sec: float) -> str:
     sec = int(round(sec))
     return f"{sec // 60}:{sec % 60:02d}"
+
+
+def _visual_qa_panel(p: jobs.Project) -> None:
+    qa = p.data.get("visual_qa")
+    if not qa:
+        return
+    status = qa.get("status", "review")
+    st.markdown(f"**Local visual QA: {'✅ Passed' if status == 'passed' else '⚠️ Review recommended'}** "
+                f"({qa.get('checked_scenes', 0)} stills checked)")
+    for issue in qa.get("issues", []):
+        st.warning(issue)
+    if not qa.get("issues"):
+        st.caption("No low-detail, near-duplicate, or missing recurring-character reference warnings were found.")
 
 
 def _est_runtime(p: jobs.Project, plan: planner.CinematicPlan) -> float:
@@ -405,6 +420,14 @@ def page_create() -> None:
                               key=f"tf_script_{_pid()}", disabled=running)
         extra = st.text_area("Extra director notes (optional)", height=70, key=f"tf_extra_{_pid()}",
                              placeholder="e.g. end on a hopeful sunrise, include a chase scene, dramatic lighting", disabled=running)
+        research_notes = st.text_area(
+            "Research notes and source links (optional)",
+            value=str((p.settings if p else {}).get("research_notes", "")),
+            height=110,
+            key=f"tf_research_{_pid()}",
+            placeholder="Paste verified facts and the URLs/titles they came from. The planner will be told not to invent citations.",
+            disabled=running,
+        )
 
     if not p:
         st.markdown("#### 2 · Target Duration & Timeline Pacing")
@@ -470,7 +493,8 @@ def page_create() -> None:
         lang = c3.selectbox("Language", list(tts.EDGE_VOICES), key="tf_new_lang")
         
         c4, c5 = st.columns(2)
-        default_src = c4.selectbox("Default visual source", list(SOURCES), format_func=lambda k: SOURCES[k], key="tf_new_src")
+        default_src = c4.selectbox("Default visual source", FREE_SOURCES,
+                                   format_func=lambda k: SOURCES[k], key="tf_new_src")
         auto = c5.toggle("🪄 Auto Cinematic Mode: let the AI choose style, pacing, look and music",
                          value=True, key="tf_new_auto",
                          help="When on, the AI fine-tunes camera moves, lighting, color grading and atmosphere for your idea.")
@@ -494,6 +518,7 @@ def page_create() -> None:
                 "voice_branding": voice_branding,
                 "brand_overlay": brand_overlay,
                 "default_source": default_src,
+                "research_notes": research_notes,
             })
             saved_logo_path = saved_bp.get("channel_logo_path", "")
             if logo_up is not None:
@@ -526,6 +551,9 @@ def page_create() -> None:
     # If project already exists:
     if idea.strip() and idea.strip() != p.data["idea"] and not running:
         p.data["idea"] = idea.strip()
+        p.save()
+    if research_notes != p.settings.get("research_notes", ""):
+        p.settings["research_notes"] = research_notes
         p.save()
 
     st.markdown("#### 2 · Target Duration & Timeline Pacing")
@@ -619,7 +647,7 @@ def page_create() -> None:
         setting(p, "aspect", "select", "Format", options=list(cinema.ASPECTS))
     with c2:
         setting(p, "language", "select", "Narration language", options=list(tts.EDGE_VOICES))
-        setting(p, "default_source", "select", "Default visual source", options=list(SOURCES),
+        setting(p, "default_source", "select", "Default visual source", options=FREE_SOURCES,
                 format_func=lambda k: SOURCES[k])
     with c3:
         setting(p, "tone", "text", "Tone", placeholder="awe-inspiring, hopeful, tense…")
@@ -831,7 +859,9 @@ def _scene_editor(p: jobs.Project, plan: planner.CinematicPlan, i: int, running:
             with st.form(f"tf_{p.id}_scene_{sc.id}_{rev}"):
                 c1, c2, c3 = st.columns([3, 2, 1])
                 title = c1.text_input("Title", sc.title)
-                source = c2.selectbox("Visual source", list(SOURCES), index=list(SOURCES).index(sc.source),
+                source_options = FREE_SOURCES
+                source_value = sc.source if sc.source in source_options else "original_motion"
+                source = c2.selectbox("Visual source", source_options, index=source_options.index(source_value),
                                       format_func=lambda k: SOURCES[k])
                 duration = c3.number_input("Min sec", 2.0, 30.0, float(sc.duration), 0.5)
                 narration = st.text_area("Narration (voice-over)", sc.narration, height=90)
@@ -841,7 +871,7 @@ def _scene_editor(p: jobs.Project, plan: planner.CinematicPlan, i: int, running:
                 n1, n2 = st.columns(2)
                 negative = n1.text_input("Negative prompt", sc.negative_prompt)
                 stock_q = n2.text_input("Stock footage keywords", sc.stock_query)
-                video_prompt = st.text_input("AI video motion prompt", sc.video_prompt)
+                video_prompt = st.text_input("Motion direction (local free motion)", sc.video_prompt)
                 g1, g2, g3, g4 = st.columns(4)
                 cam = g1.selectbox("Camera move", list(cinema.CAMERA_MOVES), index=list(cinema.CAMERA_MOVES).index(sc.camera_move))
                 shot = g2.selectbox("Shot", cinema.SHOT_TYPES, index=cinema.SHOT_TYPES.index(sc.shot_type))
@@ -869,16 +899,18 @@ def _scene_editor(p: jobs.Project, plan: planner.CinematicPlan, i: int, running:
                                        type=["png", "jpg", "jpeg", "webp", "mp4", "mov", "webm", "m4v"])
                 notes = st.text_input("Director notes for AI rewrite / enhance (optional)",
                                       placeholder="more tension, show the robot's face, rain at night…")
-                b = st.columns(4)
-                save = b[0].form_submit_button("💾 Save", type="primary", disabled=running, width="stretch")
-                gen = b[1].form_submit_button("🖼️ New image", disabled=running, width="stretch")
-                var = b[2].form_submit_button("🎲 3 variations", disabled=running, width="stretch")
-                rend = b[3].form_submit_button("🎬 Render clip", disabled=running, width="stretch")
+                b = st.columns(5)
+                refresh = b[0].form_submit_button("↻ Refresh scene", disabled=running, width="stretch")
+                save = b[1].form_submit_button("💾 Save", type="primary", disabled=running, width="stretch")
+                gen = b[2].form_submit_button("🖼️ New image", disabled=running, width="stretch")
+                var = b[3].form_submit_button("🎲 3 variations", disabled=running, width="stretch")
+                rend = b[4].form_submit_button("🎬 Render clip", disabled=running, width="stretch")
                 b2 = st.columns(3)
                 enh = b2[0].form_submit_button("✨ Enhance prompt", disabled=running, width="stretch")
                 rew = b2[1].form_submit_button("🤖 Rewrite scene (AI)", disabled=running, width="stretch")
                 voi = b2[2].form_submit_button("🔊 Preview voice", disabled=running, width="stretch")
-            if save or gen or var or rend or enh or rew or voi:
+                st.caption("Refresh generates a new frame and scene preview. Render the full film afterward to update the export.")
+            if refresh or save or gen or var or rend or enh or rew or voi:
                 st.session_state["tf_open_scene"] = sc.id
                 sc.title, sc.source, sc.duration, sc.narration = title, source, float(duration), narration
                 sc.dialogue = planner.Scene(dialogue=dialogue).dialogue
@@ -909,10 +941,21 @@ def _scene_editor(p: jobs.Project, plan: planner.CinematicPlan, i: int, running:
                     st_["seed"] = random.randint(1, 2 ** 31 - 1)
                     st_.pop("locked_image", None)
                     if sc.source in ("upload", "stock_video"):
-                        sc.source = "ai_image"
+                        sc.source = "original_motion"
+                if refresh:
+                    st_["seed"] = random.randint(1, 2 ** 31 - 1)
+                    st_.pop("locked_image", None)
+                    st_.pop("ai_video_fp", None)
+                    st_.pop("ai_video", None)
+                    sc.source = "original_motion"
+                    p.data["outputs"] = {}
+                    p.data.pop("visual_qa", None)
                 p.set_plan(plan)
                 p.save()
-                if gen:
+                if refresh:
+                    jobs.MANAGER.start_render(p, [sc.id], assemble=False)
+                    st.session_state[f"tf_was_running_{p.id}"] = True
+                elif gen:
                     jobs.MANAGER.start_render(p, [sc.id], assemble=False, assets_only=True)
                     st.session_state[f"tf_was_running_{p.id}"] = True
                 elif var:
@@ -1031,6 +1074,12 @@ def page_timeline() -> None:
     k2.metric("Est. Runtime", _fmt_time(est_total), delta=f"{est_total - tgt_total:+.0f}s" if abs(est_total - tgt_total) >= 1.0 else "on target")
     k3.metric("Scenes Count", f"{len(plan.scenes)} cuts")
     k4.metric("Total Spoken Words", f"{all_words} words", help="Based on standard ~2.35 words/sec narration speed")
+    if st.button("🧪 Run free local visual QA", disabled=running):
+        qa = jobs.quality.inspect_project(plan, p.data.get("scene_state") or {},
+                                          p.settings.get("char_refs") or {}, jobs.render_size(p.settings)[:2])
+        p.data["visual_qa"] = qa
+        p.save()
+    _visual_qa_panel(p)
 
     # Visual Multi-Segment Timeline Bar
     SEG_GRADIENTS = [
@@ -1172,19 +1221,11 @@ def page_audio() -> None:
     c1, c2 = st.columns(2)
     with c1:
         setting(p, "language", "select", "Language", options=list(tts.EDGE_VOICES))
-        eng = setting(p, "voice_engine", "select", "Voice engine", options=list(tts.TTS_ENGINES),
-                      format_func=lambda k: tts.TTS_ENGINES[k])
-        if eng == "edge":
-            opts = tts.voice_options(s["language"])
-            labels = dict(opts)
-            setting(p, "voice", "select", "Voice", options=[v for v, _ in opts], format_func=lambda v: labels.get(v, v))
-        elif eng == "cf_aura2":
-            setting(p, "voice", "select", "Aura-2 speaker", options=tts.AURA2_SPEAKERS)
-        else:
-            setting(p, "voice", "select", "Orpheus voice", options=tts.ORPHEUS_VOICES)
-        if eng != "edge":
-            st.caption("Premium engines fall back to the Microsoft neural voice automatically if unavailable "
-                       "(quota/terms); dialogue lines always use Microsoft neural voices.")
+        st.caption("Free-tier mode uses Microsoft Edge neural voices; paid speech APIs are not called.")
+        eng = "edge"
+        opts = tts.voice_options(s["language"])
+        labels = dict(opts)
+        setting(p, "voice", "select", "Voice", options=[v for v, _ in opts], format_func=lambda v: labels.get(v, v))
     with c2:
         setting(p, "voice_speed", "slider", "Speed", min_value=0.7, max_value=1.4, step=0.05)
         setting(p, "voice_pitch", "slider", "Pitch (Hz)", min_value=-30, max_value=30, step=1)
@@ -1192,8 +1233,7 @@ def page_audio() -> None:
         if st.button("▶ Preview narrator", disabled=running):
             with st.spinner("Synthesising…"):
                 try:
-                    st.session_state["tf_prev_narrator"] = tts.sample(s["voice"], s["language"], s["voice_engine"],
-                                                                      s["voice_speed"])
+                    st.session_state["tf_prev_narrator"] = tts.sample(s["voice"], s["language"], eng, s["voice_speed"])
                 except Exception as e:  # noqa: BLE001
                     st.session_state.pop("tf_prev_narrator", None)
                     st.error(f"Voice preview failed: {e}")
@@ -1259,6 +1299,7 @@ def page_render() -> None:
     running = _running(p)
     s = p.settings
     out = p.data.get("outputs") or {}
+    _visual_qa_panel(p)
     if out.get("video") and Path(out["video"]).exists():
         st.markdown(f"### 🎉 {_esc(plan.title if plan else 'Your film')}")
         v1, v2 = st.columns([3, 1])
@@ -1354,11 +1395,12 @@ def page_render() -> None:
         setting(p, "thumb_variants", "toggle", "Extra thumbnail variants (A/B test)")
     W, H, (FW, FH) = jobs.render_size(s)
     st.caption(f"Renders at {W}×{H}" + (f", upscaled to {FW}×{FH} with Lanczos + sharpening at export" if (W, H) != (FW, FH)
-                                        else "") + ". Higher resolutions and 60 fps take proportionally longer.")
+                                        else "") + ". 4K is an upscale from 1440p; 60 fps changes the output cadence but "
+                                                "does not invent new source motion.")
     st.markdown("#### 🖼️ Visual generation")
     e1, e2 = st.columns(2)
     with e1:
-        engines = ["auto"] + list(images.ENGINES)
+        engines = ["auto"] + images.AUTO_ORDER
 
         def elabel(k):
             if k == "auto":
@@ -1367,42 +1409,12 @@ def page_render() -> None:
             e = images.ENGINES[k]
             return f"{e.label} · {e.tier}" + ("" if ok else " · unavailable")
         setting(p, "image_engine", "select", "Image engine", options=engines, format_func=elabel)
-        setting(p, "allow_paid", "toggle", "Allow paid engines in Auto (OpenRouter credits)")
         setting(p, "allow_stock", "toggle", "Allow Pixabay stock photos as last-resort fallback")
-        if s["image_engine"] == "openrouter" or s["allow_paid"]:
-            setting(p, "openrouter_image_model", "text", "OpenRouter image model",
-                    placeholder=images.OPENROUTER_DEFAULT_IMAGE_MODEL)
         setting(p, "negative_global", "text", "Global negative prompt")
     with e2:
-        n_ai = sum(1 for sc in plan.scenes if sc.source == "ai_video") if plan else 0
-        st.markdown(f"**🎥 AI video scenes: {n_ai}**")
-        setting(p, "ai_video_res", "select", "AI video resolution", options=["480p", "720p", "1080p"])
-        try:
-            cands = video.compatible_models(s["scene_duration"] + 1, s["ai_video_res"], jobs.aspect_ratio_str(s), True)
-        except Exception as e:  # noqa: BLE001
-            cands = []
-            st.caption(f"Could not list OpenRouter video models: {e}")
-        if cands:
-            ids = [""] + [c["id"] for c in cands]
-            lab = {c["id"]: f"{c['name']} · {c['duration']}s {c['resolution']} · "
-                            f"{'$%.2f' % c['usd'] if c['usd'] is not None else 'price n/a'}/clip" for c in cands}
-            setting(p, "ai_video_model", "select", "AI video model", options=ids,
-                    format_func=lambda k: f"Auto ({lab[cands[0]['id']]})" if not k else lab.get(k, k))
-            mid = s.get("ai_video_model") or cands[0]["id"]
-            per = next((c["usd"] for c in cands if c["id"] == mid), None)
-            if per is not None:
-                st.caption(f"Estimated AI video cost for {n_ai} scene(s): **${per * n_ai:.2f}** "
-                           f"(spent so far in this project: ${float(p.data.get('spent_usd') or 0):.2f})")
-        setting(p, "ai_video_budget", "number", "Budget guard (USD, 0 = no limit)", min_value=0.0, max_value=500.0,
-                step=1.0)
-        cr = None
-        try:
-            cr = video.openrouter_credits()
-        except Exception:  # noqa: BLE001
-            pass
-        if cr and cr.get("is_free_tier"):
-            st.warning("Your OpenRouter key is on the free tier: AI video / paid images need credits. Scenes set to "
-                       "AI video fall back to an animated AI image (and say so in the log).")
+        st.markdown("**🎥 Free original motion**")
+        st.caption("Each scene gets an original generated frame, then local camera movement, simulated parallax and "
+                   "atmosphere. Pixabay footage is optional. Hosted AI video models are disabled to prevent charges.")
     st.markdown("#### 🚀 Produce")
     if not plan:
         st.info("Generate a plan first (✨ Create).")
@@ -1440,17 +1452,17 @@ def page_providers() -> None:
     usage = cache.usage_today()
     st.markdown("#### 🔌 Providers")
     rows = []
-    roles = {"groq": "Fast LLM (scene breakdowns), Orpheus TTS", "openrouter": "Creative LLM (free models), paid image & video",
-             "cloudflare": "FLUX.2 images, Llama/GLM LLM, Aura-2 TTS (10k free neurons/day)",
-             "pixabay": "Stock video & photos", "gemini": "LLM fallback, Gemini images (quota)",
-             "pollinations (keyed)": "Image fallback"}
+    roles = {"groq": "Free-tier LLM (scene breakdowns)", "openrouter": "Creative LLM (free models only)",
+             "cloudflare": "FLUX.2 Klein 4B images (10k free neurons/day)",
+             "pixabay": "Free stock video & photos", "gemini": "Disabled in free-only mode",
+             "pollinations (keyed)": "Disabled in free-only mode"}
     for k, ok in conf.items():
         blocked = [f"{b}: {r[:90]}" for b, r in breakers.items() if b.split(":")[0].startswith(k.split(" ")[0])]
         rows.append({"Provider": k, "Key": "✅ configured" if ok else "— missing", "Role": roles.get(k, ""),
                      "Status": ("⏸ " + " | ".join(blocked)) if blocked else ("ready" if ok else "")})
     st.dataframe(rows, hide_index=True, width="stretch")
-    st.caption("Keys are read from `.env` / environment on the server and never sent to the browser. Providers that "
-               "hit a quota pause automatically and requests fall back to the next provider.")
+    st.caption("Keys are read from `.env` / environment on the server and never sent to the browser. Only free-tier "
+               "models and providers are used; quota limits are not bypassed.")
     c1, c2, c3 = st.columns(3)
     c1.metric("Cloudflare neurons today (est.)", f"{usage.get('cloudflare_neurons', 0):.0f}",
               f"of {cache.CLOUDFLARE_FREE_NEURONS} free", delta_color="off")
@@ -1480,7 +1492,8 @@ def page_providers() -> None:
         st.rerun()
     st.markdown("#### Available image engines")
     st.dataframe([{"Engine": e.label, "Tier": e.tier, "Refs": "✅" if e.refs else "", "Ready": "✅" if images.engine_available(k)[0]
-                   else "— " + images.engine_available(k)[1][:80], "Note": e.note} for k, e in images.ENGINES.items()],
+                   else "— " + images.engine_available(k)[1][:80], "Note": e.note} for k, e in images.ENGINES.items()
+                  if k in images.FREE_ENGINE_KEYS],
                  hide_index=True, width="stretch")
 
 
@@ -1505,8 +1518,9 @@ def render_studio(public_mode: bool = False) -> None:
             busy = [x["title"] for x in projects if jobs.MANAGER.is_running(x["id"])]
             if busy:
                 st.caption("⚙️ Running: " + ", ".join(b[:24] for b in busy))
-        st.caption("Free providers first (Groq, Cloudflare, Pollinations, Pixabay, Microsoft voices); paid AI "
-                   "video/images only when you opt in.")
+        if st.button("↻ Refresh projects and page", width="stretch"):
+            st.rerun()
+        st.caption("Generation is restricted to free-tier providers/models and local tools. Free provider quotas and availability apply.")
     st.markdown("<div class='tf-hero'><h1>TubeForge Cinematic AI Studio</h1><p>Idea → story → characters → scenes → "
                 "visuals → voice → music → edit → render → export. Hollywood-style camera moves, colour grading, "
                 "atmosphere, sound design and subtitles.</p></div>", unsafe_allow_html=True)

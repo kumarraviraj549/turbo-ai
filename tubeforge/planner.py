@@ -85,7 +85,7 @@ class Scene(BaseModel):
     environment: str = ""
     stock_query: str = ""
     duration: float = 0.0
-    source: str = "ai_image"  # ai_image | stock_video | ai_video | upload
+    source: str = "original_motion"  # original_motion | ai_image | stock_video | ai_video | upload
 
     @field_validator("dialogue", mode="before")
     @classmethod
@@ -143,7 +143,7 @@ class Scene(BaseModel):
         cue = str(self.music_cue or "").lower()
         self.music_cue = next((c for c in ("calm", "build", "climax", "tension", "resolve", "silence") if c in cue), "")
         self.overlay_kind = cinema.closest(self.overlay_kind, ["Title", "Subtitle", "Lower third", "Chapter"], "Title")
-        if self.source not in ("ai_image", "stock_video", "ai_video", "upload"):
+        if self.source not in ("original_motion", "ai_image", "stock_video", "ai_video", "upload"):
             self.source = "ai_image"
         if self.duration <= 0:
             self.duration = default_duration
@@ -169,6 +169,7 @@ class CinematicPlan(BaseModel):
     youtube_title: str = ""
     youtube_description: str = ""
     tags: List[str] = Field(default_factory=list)
+    research_sources: List[str] = Field(default_factory=list)
     scenes: List[Scene] = Field(default_factory=list)
     models_used: List[str] = Field(default_factory=list)
 

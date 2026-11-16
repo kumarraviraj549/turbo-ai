@@ -1516,13 +1516,10 @@ if APP_PASSWORD and not st.session_state.get("authenticated"):
             st.error("Wrong password.")
     st.stop()
 
-STUDIO_MODES = ["🎬 Cinematic AI Studio (new)", "🧰 Classic Studio"]
-studio_mode = st.sidebar.radio("Studio", STUDIO_MODES, key="studio_mode", horizontal=False)
-if studio_mode == STUDIO_MODES[0]:
-    from tubeforge.studio_ui import render_studio
+from tubeforge.studio_ui import render_studio
 
-    render_studio(public_mode=PUBLIC_MODE)
-    st.stop()
+render_studio(public_mode=PUBLIC_MODE)
+st.stop()
 
 
 def _project_timestamp(folder_name: str) -> Optional[int]:
