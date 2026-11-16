@@ -47,6 +47,24 @@ def _chord(root_semi: int, quality: str) -> List[int]:
     return [root_semi + i for i in iv]
 
 
+def _ambient_variation(seed: int) -> Tuple[str, int, List[Tuple[int, str]], float]:
+    """Returns a calm, repeatable key, progression, tempo, and tone for an ambient score."""
+    rng = np.random.default_rng(seed)
+    roots = list(NOTE)
+    progressions = [
+        [(0, "sus"), (9, "m"), (5, "M"), (7, "sus")],
+        [(0, "M"), (5, "M"), (9, "m"), (7, "sus")],
+        [(0, "m"), (5, "M"), (3, "M"), (-2, "sus")],
+        [(0, "sus"), (-5, "M"), (2, "m"), (-3, "M")],
+        [(0, "M"), (2, "m"), (7, "M"), (5, "M")],
+    ]
+    root = roots[int(rng.integers(len(roots)))]
+    progression = progressions[int(rng.integers(len(progressions)))]
+    bpm = int(rng.integers(52, 70))
+    brightness = float(rng.uniform(0.38, 0.62))
+    return root, bpm, progression, brightness
+
+
 def _spectral(x: np.ndarray, lo: float = 0.0, hi: float = 22050.0, tilt: float = 0.0) -> np.ndarray:
     """Zero-phase FFT band filter with optional spectral tilt (dB/octave) - circular, so loops stay seamless."""
     n = x.shape[0]
@@ -141,7 +159,10 @@ def _write_wav(path: Path, x: np.ndarray) -> Path:
 def compose_score(mood: str, seed: int = 1) -> Tuple[Path, Path, float]:
     """Composes a seamless loop for the mood. Returns (harmony_stem.wav, percussion_stem.wav, loop_seconds)."""
     mood = mood if mood in MOODS else "epic"
-    m = MOODS[mood]
+    m = dict(MOODS[mood])
+    if mood == "ambient":
+        root, bpm, progression, brightness = _ambient_variation(seed)
+        m.update(root=root, bpm=bpm, prog=progression, bright=brightness)
     harm_p = AUDIO_CACHE / f"score_{mood}_{seed}_harm.wav"
     perc_p = AUDIO_CACHE / f"score_{mood}_{seed}_perc.wav"
     beat = 60.0 / m["bpm"]

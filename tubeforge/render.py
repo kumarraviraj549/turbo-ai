@@ -1057,7 +1057,8 @@ def export_final(video_in: Path, audio_in: Optional[Path], out: Path, width: int
 
 
 def make_thumbnail(image_path: Path, title: str, out: Path, W: int = 1280, H: int = 720,
-                   channel_name: str = "", logo_path: Optional[Path] = None) -> Path:
+                   channel_name: str = "", logo_path: Optional[Path] = None, hook: str = "",
+                   variant: int = 0) -> Path:
     img = cover_resize(Image.open(image_path).convert("RGB"), W, H)
     img = ImageEnhance.Contrast(img).enhance(1.12)
     img = ImageEnhance.Color(img).enhance(1.2)
@@ -1065,9 +1066,43 @@ def make_thumbnail(image_path: Path, title: str, out: Path, W: int = 1280, H: in
     shade = Image.linear_gradient("L").resize((W, H)).point(lambda v: int(v * 0.75))
     dark = Image.new("RGB", (W, H), (0, 0, 0))
     img = Image.composite(dark, img, shade)
-    ttl, x, y = render_title_png(title, "Title", W, H)
     base = img.convert("RGBA")
-    base.alpha_composite(ttl, (x, int(H * 0.62 - ttl.height / 2)))
+    draw = ImageDraw.Draw(base)
+    accents = [(255, 213, 74), (83, 220, 244), (255, 126, 112)]
+    accent = accents[variant % len(accents)]
+    label = textwrap.shorten(re.sub(r"\s+", " ", title.strip()), width=34, placeholder="…").upper()
+    label_font = load_font(max(18, int(H * 0.033)), label)
+    label_w = min(int(label_font.getlength(label)), int(W * 0.7))
+    label_h = int(label_font.size * 1.65)
+    label_x, label_y = int(W * 0.055), int(H * 0.075)
+    draw.rounded_rectangle((label_x, label_y, label_x + label_w + 30, label_y + label_h),
+                           radius=label_h // 4, fill=accent)
+    draw.text((label_x + 15, label_y + (label_h - label_font.size) // 2 - 2), label,
+              font=label_font, fill=(12, 16, 28, 255))
+
+    copy = re.sub(r"\s+", " ", (hook or title).strip())
+    copy = re.split(r"(?<=[.!?])\s+|\n+", copy, maxsplit=1)[0]
+    copy = textwrap.shorten(copy, width=52, placeholder="…")
+    copy_font_size = int(H * 0.115)
+    lines = textwrap.wrap(copy, width=20, max_lines=3, placeholder="…") or [copy]
+    max_width = int(W * 0.76)
+    while copy_font_size > 32:
+        copy_font = load_font(copy_font_size, copy)
+        if max(int(copy_font.getlength(line)) for line in lines) <= max_width:
+            break
+        copy_font_size -= 2
+    copy_font = load_font(copy_font_size, copy)
+    line_height = int(copy_font_size * 1.12)
+    copy_y = int(H * 0.52)
+    for i, line in enumerate(lines):
+        y = copy_y + i * line_height
+        fill = accent + (255,) if i == len(lines) - 1 else (255, 255, 255, 255)
+        draw.text((int(W * 0.055) + 3, y + 4), line, font=copy_font, fill=(0, 0, 0, 220),
+                  stroke_width=5, stroke_fill=(0, 0, 0, 220))
+        draw.text((int(W * 0.055), y), line, font=copy_font, fill=fill,
+                  stroke_width=3, stroke_fill=(10, 12, 20, 230))
+    draw.rounded_rectangle((int(W * 0.055), copy_y - 16, int(W * 0.055) + 12, copy_y - 4),
+                           radius=6, fill=accent)
     if channel_name.strip() or (logo_path and Path(logo_path).exists()):
         b_img, bx, by = render_brand_watermark_png(W, H, False, logo_path, channel_name, "Top-Right")
         if b_img.width > 1 and b_img.height > 1:

@@ -33,7 +33,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "transition_override": "", "subtitle_style": "Cinematic", "caption_words": 7,
     "voice_engine": "edge", "voice": "en-US-AndrewMultilingualNeural", "voice_speed": 1.0, "voice_pitch": 0,
     "dialogue_voices": True, "character_voices": {},
-    "music_mood": "auto", "music_path": "", "music_vol": 0.35, "voice_vol": 1.0, "fx_vol": 0.5, "duck": 0.6,
+    "music_mood": "ambient", "music_path": "", "music_vol": 0.35, "voice_vol": 1.0, "fx_vol": 0.5, "duck": 0.6,
     "ambience_on": True, "sfx_on": True, "loudness": -14.0,
     "image_engine": "auto", "openrouter_image_model": "", "allow_paid": False, "allow_stock": True,
     "default_source": "ai_image", "negative_global": "blurry, low quality, distorted, deformed, watermark, text, logo",
@@ -54,6 +54,10 @@ STEP_STATES = ("pending", "visual", "voice", "rendering", "done", "error", "canc
 
 def _fp(*parts) -> str:
     return hashlib.sha1(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def _music_seed(project_id: str) -> int:
+    return int(hashlib.sha256(f"tubeforge-music:{project_id}".encode()).hexdigest()[:16], 16)
 
 
 def _file_sig(p: str) -> str:
@@ -874,7 +878,7 @@ def assemble_film(p: Project, ev: threading.Event) -> None:
     user_music = Path(s["music_path"]) if s.get("music_path") and Path(s["music_path"]).exists() else None
     if mood != "none" or user_music:
         music_wav = audio.build_music(work / "music.wav", total, mood if mood != "none" else "ambient", cues,
-                                      seed=int(p.state(scenes[0].id).get("seed", 1)) % 97 + 1, user_music=user_music)
+                                      seed=_music_seed(p.id), user_music=user_music)
     mix = audio.mix_final(voice_wav, music_wav, fx_wav, work / "mix.m4a", total, voice_vol=float(s["voice_vol"]),
                           music_vol=float(s["music_vol"]), fx_vol=float(s["fx_vol"]), duck=float(s["duck"]),
                           loudness=float(s["loudness"]))
@@ -895,7 +899,8 @@ def assemble_film(p: Project, ev: threading.Event) -> None:
         subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", "1", "-i", str(silent), "-frames:v", "1", str(thumb_src)],
                        check=False)
     logo_p = Path(s["channel_logo_path"]) if s.get("channel_logo_path") and Path(s["channel_logo_path"]).exists() else None
-    thumb = render.make_thumbnail(thumb_src, plan.youtube_title or plan.title, out_dir / "thumbnail.jpg", channel_name=s.get("channel_name", ""), logo_path=logo_p)
+    thumb = render.make_thumbnail(thumb_src, plan.youtube_title or plan.title, out_dir / "thumbnail.jpg",
+                                  channel_name=s.get("channel_name", ""), logo_path=logo_p, hook=plan.hook)
     thumbs = [str(thumb)]
     if s.get("thumb_variants", True):
         imgs = [Path(p.state(sc.id)["image"]) for sc in scenes if p.state(sc.id).get("image")
@@ -908,7 +913,8 @@ def assemble_film(p: Project, ev: threading.Event) -> None:
             try:
                 thumbs.append(str(render.make_thumbnail(src, plan.youtube_title or plan.title,
                                                         out_dir / f"thumbnail_{k}.jpg",
-                                                        channel_name=s.get("channel_name", ""), logo_path=logo_p)))
+                                                        channel_name=s.get("channel_name", ""), logo_path=logo_p,
+                                                        hook=plan.hook, variant=k - 1)))
             except Exception as e:  # noqa: BLE001
                 p.log(f"⚠️ Thumbnail variant {k} skipped: {e}")
     short = ""

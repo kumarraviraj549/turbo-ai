@@ -1,0 +1,7 @@
+.env
+.saved_keys.json
+.git/
+__pycache__/
+output/
+venv/
+*.py[cod]
