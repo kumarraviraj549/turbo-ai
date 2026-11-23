@@ -14,6 +14,7 @@ from .config import CACHE_DIR
 
 SR = 44100
 AUDIO_CACHE = CACHE_DIR / "audio"
+SCORE_VERSION = 2
 
 NOTE = {"C": 0, "C#": 1, "D": 2, "D#": 3, "E": 4, "F": 5, "F#": 6, "G": 7, "G#": 8, "A": 9, "A#": 10, "B": 11}
 
@@ -63,6 +64,20 @@ def _ambient_variation(seed: int) -> Tuple[str, int, List[Tuple[int, str]], floa
     bpm = int(rng.integers(52, 70))
     brightness = float(rng.uniform(0.38, 0.62))
     return root, bpm, progression, brightness
+
+
+def _mood_variation(mood: str, seed: int) -> Dict:
+    """Create a stable but distinct key, tempo, and chord order for each film's mood."""
+    arrangement = dict(MOODS[mood])
+    rng = np.random.default_rng(seed)
+    arrangement["transpose"] = int(rng.choice([-3, -2, 0, 2, 4, 5]))
+    arrangement["bpm"] = max(40, arrangement["bpm"] + int(rng.integers(-4, 5)))
+    progression = list(arrangement["prog"])
+    if len(progression) > 1:
+        offset = int(rng.integers(0, len(progression)))
+        arrangement["prog"] = progression[offset:] + progression[:offset]
+    arrangement["bright"] = float(np.clip(arrangement["bright"] + rng.uniform(-0.06, 0.06), 0.25, 0.95))
+    return arrangement
 
 
 def _spectral(x: np.ndarray, lo: float = 0.0, hi: float = 22050.0, tilt: float = 0.0) -> np.ndarray:
@@ -159,12 +174,15 @@ def _write_wav(path: Path, x: np.ndarray) -> Path:
 def compose_score(mood: str, seed: int = 1) -> Tuple[Path, Path, float]:
     """Composes a seamless loop for the mood. Returns (harmony_stem.wav, percussion_stem.wav, loop_seconds)."""
     mood = mood if mood in MOODS else "epic"
-    m = dict(MOODS[mood])
     if mood == "ambient":
+        m = dict(MOODS[mood])
         root, bpm, progression, brightness = _ambient_variation(seed)
         m.update(root=root, bpm=bpm, prog=progression, bright=brightness)
-    harm_p = AUDIO_CACHE / f"score_{mood}_{seed}_harm.wav"
-    perc_p = AUDIO_CACHE / f"score_{mood}_{seed}_perc.wav"
+        m["transpose"] = 0
+    else:
+        m = _mood_variation(mood, seed)
+    harm_p = AUDIO_CACHE / f"score_v{SCORE_VERSION}_{mood}_{seed}_harm.wav"
+    perc_p = AUDIO_CACHE / f"score_v{SCORE_VERSION}_{mood}_{seed}_perc.wav"
     beat = 60.0 / m["bpm"]
     bar = beat * 4
     chord_len = bar * 2
@@ -175,7 +193,7 @@ def compose_score(mood: str, seed: int = 1) -> Tuple[Path, Path, float]:
     rng = np.random.default_rng(seed)
     harm = np.zeros((n, 2), dtype=np.float32)
     perc = np.zeros((n, 2), dtype=np.float32)
-    root = NOTE[m["root"]] - 9 - 12  # semitones from A4, octave 3
+    root = NOTE[m["root"]] - 9 - 12 + int(m.get("transpose", 0))  # semitones from A4, octave 3
     bright = m["bright"]
     pad_h = [1.0 * bright ** 0.2] + [bright ** (h * 0.5) / (h + 1) for h in range(1, 8)]
     for ci, (off, q) in enumerate(m["prog"]):

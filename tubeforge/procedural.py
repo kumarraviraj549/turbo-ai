@@ -61,42 +61,6 @@ def scene_props(scene, settings: Dict[str, Any], duration: float, research_sourc
         "kinetic_hook_title": {"hookText", "kicker"},
     }
     _check_keys(data, allowed_fields[template], "template props")
-    if template == "quote_evidence_card":
-        source = _text(data.get("source"), "", 300)
-        known_sources = [str(item) for item in research_sources if item]
-        if not source or source not in known_sources:
-            raise ValueError("Evidence card citations must match a source in the Story research sources.")
-    if template == "2d_character_explainer":
-        emotion = data.get("emotion", "explaining")
-        if emotion not in ("neutral", "happy", "shocked", "explaining", "serious"):
-            raise ValueError("Unsupported 2D character emotion.")
-        timeline = data.get("mouthStateTimeline", [])
-        if not isinstance(timeline, list):
-            raise ValueError("mouthStateTimeline must be a list.")
-        clean_timeline = []
-        for state in timeline:
-            if not isinstance(state, dict):
-                raise ValueError("Each mouth state must be an object.")
-            mouth = state.get("mouth")
-            if mouth not in ("closed", "half", "open", "wide"):
-                raise ValueError("Unsupported mouth state.")
-            start = int(state.get("startFrame", 0))
-            end = int(state.get("endFrame", start))
-            if start < 0 or end < start:
-                raise ValueError("Invalid mouth-state frame range.")
-            clean_timeline.append({"startFrame": start, "endFrame": end, "mouth": mouth})
-        props.update({
-            "characterName": _text(data.get("characterName"), scene.title or "Explainer", 80),
-            "emotion": emotion,
-            "mouthStateTimeline": clean_timeline,
-        })
-        if isinstance(data.get("characterSvg"), str):
-            props["characterSvg"] = data["characterSvg"][:3000]
-    if template == "kinetic_hook_title":
-        props.update({
-            "hookText": _text(data.get("hookText"), scene.title or "The Hidden Truth", 160),
-            "kicker": _text(data.get("kicker"), "WATCH THIS", 80),
-        })
     props: Dict[str, Any] = {
         "template": template,
         "durationInSeconds": max(1.0, min(30.0, float(duration))),
@@ -202,14 +166,45 @@ def scene_props(scene, settings: Dict[str, Any], duration: float, research_sourc
             {"label": "Discover", "caption": ""},
             {"label": _text(scene.title, "Outcome", 60), "caption": ""},
         ]
-    else:
-        known_sources = [str(item) for item in research_sources if item]
+    elif template == "quote_evidence_card":
         source = _text(data.get("source"), "", 300)
+        known_sources = [str(item) for item in research_sources if item]
         if source not in known_sources:
             raise ValueError("Evidence card citations must match a source in the Story research sources.")
         props.update({
             "quote": _text(data.get("quote"), scene.narration or "Verified story evidence", 500),
             "source": source,
             "context": _text(data.get("context"), "", 200),
+        })
+    elif template == "2d_character_explainer":
+        emotion = data.get("emotion", "explaining")
+        if emotion not in ("neutral", "happy", "shocked", "explaining", "serious"):
+            raise ValueError("Unsupported 2D character emotion.")
+        timeline = data.get("mouthStateTimeline", [])
+        if not isinstance(timeline, list):
+            raise ValueError("mouthStateTimeline must be a list.")
+        clean_timeline = []
+        for state in timeline:
+            if not isinstance(state, dict):
+                raise ValueError("Each mouth state must be an object.")
+            mouth = state.get("mouth")
+            if mouth not in ("closed", "half", "open", "wide"):
+                raise ValueError("Unsupported mouth state.")
+            start = int(state.get("startFrame", 0))
+            end = int(state.get("endFrame", start))
+            if start < 0 or end < start:
+                raise ValueError("Invalid mouth-state frame range.")
+            clean_timeline.append({"startFrame": start, "endFrame": end, "mouth": mouth})
+        props.update({
+            "characterName": _text(data.get("characterName"), scene.title or "Explainer", 80),
+            "emotion": emotion,
+            "mouthStateTimeline": clean_timeline,
+        })
+        if isinstance(data.get("characterSvg"), str):
+            props["characterSvg"] = data["characterSvg"][:3000]
+    elif template == "kinetic_hook_title":
+        props.update({
+            "hookText": _text(data.get("hookText"), scene.title or "The Hidden Truth", 160),
+            "kicker": _text(data.get("kicker"), "WATCH THIS", 80),
         })
     return props

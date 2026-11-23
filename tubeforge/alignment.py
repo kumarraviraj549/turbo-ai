@@ -67,17 +67,16 @@ def _groq_one(path: Path, language: Optional[str]) -> List[dict]:
     ]
     if language:
         data.append(("language", language))
-    with path.open("rb") as audio_file:
-        response = request(
-            "groq",
-            "POST",
-            "https://api.groq.com/openai/v1/audio/transcriptions",
-            headers={"Authorization": f"Bearer {config.groq_key()}"},
-            data=data,
-            files={"file": (path.name, audio_file)},
-            timeout=180,
-            retries=1,
-        )
+    response = request(
+        "groq",
+        "POST",
+        "https://api.groq.com/openai/v1/audio/transcriptions",
+        headers={"Authorization": f"Bearer {config.groq_key()}"},
+        data=data,
+        files={"file": (path.name, path.read_bytes())},
+        timeout=180,
+        retries=1,
+    )
     try:
         payload = response.json()
     except ValueError as exc:
@@ -261,16 +260,19 @@ def persist_distinct_beats(project_data: Dict, visual_beats: Sequence[dict], sou
     """Persist child beats and enforce a resume-safe visual-difference tuple."""
     preserved = []
     climax_count = 0
+    motion_moves = [
+        "dolly_in", "orbital_right", "dolly_out", "handheld", "crane_up",
+        "close_up", "pan_right", "drone_flyover", "dutch_tilt",
+    ]
     for index, beat in enumerate(visual_beats):
         item = dict(beat)
-        if index == 0:
-            treatment = {"motionEngine": "depthflow_3d", "cameraPreset": "dolly_in",
-                         "cropRect": [0.0, 0.0, 1.0, 1.0]}
-        else:
-            preset = "orbital_right" if index % 2 else "dolly_in"
-            crop = [0.10, 0.08, 0.80, 0.84] if index % 2 else [0.05, 0.04, 0.90, 0.92]
-            treatment = {"motionEngine": "depthflow_3d", "cameraPreset": preset,
-                         "cropRect": crop}
+        preset = motion_moves[index % len(motion_moves)]
+        previous = preserved[-1]["visualTreatment"]["cameraPreset"] if preserved else ""
+        if preset == previous:
+            preset = motion_moves[(index + 1) % len(motion_moves)]
+        crop = ([0.0, 0.0, 1.0, 1.0] if index == 0 else
+                [0.10 + (index % 3) * 0.025, 0.07, 0.80, 0.86])
+        treatment = {"motionEngine": "depthflow_3d", "cameraPreset": preset, "cropRect": crop}
         item["childBeat"] = True
         item["beatIndex"] = index
         item["sourceAssetHash"] = source_asset_hash

@@ -1,6 +1,7 @@
 """Video sources: OpenRouter AI video generation and Pixabay/Pexels stock footage."""
 import base64
 import io
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -23,6 +24,149 @@ _RES_PIXELS = {"360p": (640, 360), "480p": (854, 480), "720p": (1280, 720), "768
 
 class VideoGenError(RuntimeError):
     pass
+
+
+def paid_video_estimate(model_count: int, seconds: float, usd_per_clip: float) -> dict:
+    """Visible, conservative estimate; actual provider accounting remains in the provider."""
+    estimate = round(max(0, int(model_count)) * max(0.0, float(seconds)) * max(0.0, float(usd_per_clip)), 3)
+    return {"clip_count": max(0, int(model_count)), "seconds": max(0.0, float(seconds)),
+            "usd": estimate, "provider": "OpenRouter/fal/Replicate"}
+
+
+def can_spend_paid_video(project_settings: dict, estimate_usd: float) -> bool:
+    """Hard per-project USD guard. Cached results cost $0 and never require spending."""
+    if not project_settings.get("allow_paid_video", False):
+        return False
+    if estimate_usd is None:
+        return False
+    try:
+        estimate_usd = float(estimate_usd)
+    except (TypeError, ValueError):
+        return False
+    budget = float(project_settings.get("paid_video_budget_usd", 0.0) or 0.0)
+    spent = float(project_settings.get("paid_video_spent_usd", 0.0) or 0.0)
+    return (math.isfinite(budget) and math.isfinite(spent) and math.isfinite(estimate_usd)
+            and budget > 0 and estimate_usd > 0 and spent + estimate_usd <= budget)
+
+
+def export_flow_pack(scene, image_path: Path, out_path: Path) -> Path:
+    """Creates a manual Google Flow import pack; no browser or Google web UI automation."""
+    import json
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    pack = {
+        "provider": "Google Flow / Google Vids",
+        "automation": False,
+        "first_frame": str(image_path),
+        "prompt": " ".join(filter(None, [
+            getattr(scene, "video_prompt", ""), getattr(scene, "subject", ""),
+            getattr(scene, "action", ""), getattr(scene, "mood", ""),
+        ])),
+        "shot": getattr(scene, "shot_type", ""),
+        "lens": getattr(scene, "lens", ""),
+        "camera": getattr(scene, "camera_move", ""),
+        "lighting": getattr(scene, "lighting", ""),
+        "negative_prompt": getattr(scene, "negative_prompt", ""),
+        "duration_seconds": float(getattr(scene, "duration", 5.0)),
+        "aspect_ratio": "16:9",
+    }
+    out_path.write_text(json.dumps(pack, indent=2, ensure_ascii=False), encoding="utf-8")
+    return out_path
+
+
+def import_comfy_workflow(path: Path) -> dict:
+    """Accept a ComfyUI-exported API prompt JSON and reject prompts without a mapping."""
+    import json
+    path = Path(path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, dict) and isinstance(data.get("prompt"), dict):
+        data = data["prompt"]
+    if not isinstance(data, dict) or not data:
+        raise VideoGenError("ComfyUI workflow must be a non-empty exported API prompt JSON object.")
+    if not all(isinstance(key, str) and isinstance(value, dict) for key, value in data.items()):
+        raise VideoGenError("Invalid ComfyUI API prompt: node IDs must map to node objects.")
+    return data
+
+
+def comfy_submit(base_url: str, workflow: dict) -> dict:
+    """Submit an imported ComfyUI API workflow to the documented /prompt route."""
+    from urllib.parse import urlparse
+    parsed = urlparse(base_url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise VideoGenError("ComfyUI URL is invalid.")
+    resp = request("comfyui", "POST", base_url.rstrip("/") + "/prompt", json={"prompt": workflow},
+                   timeout=30, retries=2)
+    data = resp.json()
+    if not data.get("prompt_id"):
+        raise VideoGenError("ComfyUI /prompt did not return a prompt_id.")
+    return data
+
+
+def comfy_history(base_url: str, prompt_id: str) -> dict:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", str(prompt_id or "")):
+        raise VideoGenError("Invalid ComfyUI prompt_id.")
+    resp = request("comfyui", "GET", base_url.rstrip("/") + "/history/" + prompt_id,
+                   timeout=30, retries=2)
+    return resp.json().get(prompt_id) or {}
+
+
+def generate_comfy_clip(base_url: str, workflow: dict, out_path: Path,
+                        poll_timeout: float = 900,
+                        should_cancel: Optional[Callable[[], bool]] = None,
+                        log: Optional[Callable[[str], None]] = None) -> Dict:
+    """Run a user-exported ComfyUI API workflow and retrieve its first output.
+
+    This deliberately does not rewrite node IDs or invent Wan/LTX fields. The workflow
+    must already reference an uploaded image and export one video filename.
+    """
+    if not base_url:
+        raise VideoGenError("ComfyUI URL is not configured")
+    submission = comfy_submit(base_url, workflow)
+    prompt_id = submission["prompt_id"]
+    started = time.time()
+    history = {}
+    while time.time() - started < poll_timeout:
+        if should_cancel and should_cancel():
+            raise VideoGenError("cancelled by user")
+        history = comfy_history(base_url, prompt_id)
+        if history:
+            status = history.get("status") or {}
+            if status.get("status_str") == "error":
+                raise VideoGenError("ComfyUI workflow failed: " + str(status))
+            outputs = history.get("outputs") or {}
+            if outputs:
+                break
+        time.sleep(2.0)
+    if not history:
+        raise VideoGenError(f"ComfyUI job {prompt_id} timed out")
+    outputs = history.get("outputs") or {}
+    candidates = []
+    for node_output in outputs.values():
+        if not isinstance(node_output, dict):
+            continue
+        for key in ("images", "gifs", "videos"):
+            for item in node_output.get(key) or []:
+                if isinstance(item, dict) and item.get("filename"):
+                    suffix = Path(str(item["filename"])).suffix.lower()
+                    if key != "images" and suffix in (".mp4", ".mov", ".webm", ".mkv", ".gif"):
+                        candidates.append(item)
+    if not candidates:
+        raise VideoGenError("ComfyUI completed but exposed no downloadable video/image output")
+    item = candidates[0]
+    from urllib.parse import urlencode
+    params = {"filename": item["filename"]}
+    if item.get("subfolder"):
+        params["subfolder"] = item["subfolder"]
+    if item.get("type"):
+        params["type"] = item["type"]
+    data = request("comfyui", "GET", base_url.rstrip("/") + "/view?" + urlencode(params),
+                   timeout=300, retries=2).content
+    if len(data) < 100:
+        raise VideoGenError("ComfyUI returned an empty output")
+    out_path.write_bytes(data)
+    if log:
+        log(f"🎞️ ComfyUI clip ready: {prompt_id}")
+    return {"provider": "comfyui_local", "prompt_id": prompt_id, "filename": item["filename"],
+            "usd": 0.0, "cached": False}
 
 
 def _auth() -> dict:

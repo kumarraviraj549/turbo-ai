@@ -66,8 +66,13 @@ STATUS_ICON = {"pending": "⏳", "visual": "🖼️", "voice": "🎙️", "rende
                "cancelled": "⏹️", "assets": "📦"}
 SOURCES = {"ai_image": "AI image + camera move", "stock_video": "Stock footage (Pixabay + Pexels)",
            "original_motion": "Original AI scene + free local motion",
-           "ai_video": "Hosted AI video (disabled in free mode)", "upload": "My upload"}
-FREE_SOURCES = ["original_motion", "ai_image", "stock_video", "upload"]
+           "ai_video": "Hosted AI video (explicit opt-in)",
+           "comfyui_local": "ComfyUI local GPU (imported workflow)",
+           "comfyui_remote": "ComfyUI remote tunnel (explicit opt-in)",
+           "flow_manual": "Google Flow pack + manual MP4 import",
+           "upload": "My upload"}
+FREE_SOURCES = ["original_motion", "ai_image", "stock_video", "ai_video",
+                "comfyui_local", "comfyui_remote", "flow_manual", "upload"]
 VIDEO_SOURCES = {
     "original_motion": "Built-in FFmpeg parallax",
     "depthflow_3d": "DepthFlow 3D depth parallax",
@@ -123,6 +128,13 @@ def _display_brand_badge(channel_name: str, logo_source: Optional[Any] = None) -
         f"</div>",
         unsafe_allow_html=True
     )
+    if s.get("youtube_playlist_title", "").strip():
+        playlist_id = youtube_upload.insert_playlist(
+            [video_id], client, token,
+            s["youtube_playlist_title"].strip(),
+            description=(plan.youtube_description if plan else "")[:5000],
+        )
+        st.success(f"Added private draft to playlist: {playlist_id}")
 
 
 # ---------------------------------------------------------------------------------------------- helpers
@@ -1872,16 +1884,25 @@ def page_audio() -> None:
                 p.settings["music_path"] = ""
                 p.save()
                 st.rerun()
+        if st.button("🎼 Generate a different score", disabled=running):
+            with p.lock:
+                p.settings["music_variation"] = int(p.settings.get("music_variation", 0) or 0) + 1
+            p.save()
+            st.session_state.pop("tf_prev_score", None)
+            st.rerun()
         if st.button("▶ Preview generated score", disabled=running):
             mood = s["music_mood"] if s["music_mood"] not in ("auto", "none") else (plan.music_mood if plan else "epic")
+            seed = jobs._music_seed(p.id, int(s.get("music_variation", 0)))
             with st.spinner(f"Composing a {mood} score…"):
-                out = config.CACHE_DIR / "audio" / f"preview_{mood}.wav"
-                audio.build_music(out, 24.0, mood, [(0, 8, "calm"), (8, 16, "build"), (16, 24, "climax")])
+                out = config.CACHE_DIR / "audio" / f"preview_{mood}_{seed}.wav"
+                audio.build_music(out, 24.0, mood, [(0, 8, "calm"), (8, 16, "build"), (16, 24, "climax")],
+                                  seed=seed)
                 st.session_state["tf_prev_score"] = str(out)
         if st.session_state.get("tf_prev_score") and Path(st.session_state["tf_prev_score"]).exists():
             st.audio(st.session_state["tf_prev_score"])
-        st.caption("The score is composed on your machine (royalty-free): cinematic chord progressions, pads, "
-                   "strings and percussion that follow each scene's music cue.")
+        st.caption("The score is composed locally: layered pads, chord voicings, arpeggios and mood-specific percussion "
+                   "follow each scene's cue. Each project gets its own variation; use “Generate a different score” to "
+                   "change key, tempo and chord order. For orchestral or higher-fidelity music, upload a licensed track.")
     with m2:
         setting(p, "voice_vol", "slider", "Voice volume", min_value=0.2, max_value=2.0, step=0.05)
         setting(p, "music_vol", "slider", "Music volume", min_value=0.0, max_value=1.0, step=0.05)
@@ -1996,8 +2017,22 @@ def page_render() -> None:
                     st.markdown("**Pinned Comment:**")
                     st.code(out["pinned_comment"], language=None)
         if out.get("video") and Path(out["video"]).is_file():
+            with st.expander("YouTube upload metadata"):
+                setting(p, "youtube_category_id", "text", "YouTube category ID", placeholder="27")
+                setting(p, "youtube_default_language", "text", "Default language (ISO 639-1)",
+                        placeholder="en")
+                setting(p, "youtube_contains_synthetic_media", "toggle",
+                        "Contains altered or synthetic media (YouTube disclosure)")
+                setting(p, "youtube_publish_at", "text",
+                        "Optional schedule time (ISO 8601; private until then)", placeholder="2027-01-01T00:00:00Z")
+                setting(p, "youtube_disclosure_acknowledged", "toggle",
+                        "I reviewed YouTube's synthetic-media disclosure requirements")
+                setting(p, "youtube_playlist_title", "text", "Optional YouTube playlist title")
             if st.button("Upload as PRIVATE YouTube draft", disabled=running,
                          key=f"tf_{p.id}_youtube_upload"):
+                if s.get("youtube_contains_synthetic_media") and not s.get("youtube_disclosure_acknowledged"):
+                    st.error("Synthetic-media disclosure must be acknowledged before YouTube upload.")
+                    return
                 client = Path(config.youtube_client_secret_path())
                 token = config.CACHE_DIR / "youtube" / "token.json"
                 try:
@@ -2009,6 +2044,10 @@ def page_render() -> None:
                         thumbnail=Path(out["thumbnail"]) if out.get("thumbnail") else None,
                         captions_srt=Path(out["srt"]) if out.get("srt") else None,
                         caption_language={"Hindi": "hi", "English": "en"}.get(s.get("language", "English"), "en"),
+                        category_id=s.get("youtube_category_id", "27"),
+                        default_language=s.get("youtube_default_language", ""),
+                        contains_synthetic_media=bool(s.get("youtube_contains_synthetic_media", False)),
+                        publish_at=s.get("youtube_publish_at", ""),
                     )
                     st.success(f"Uploaded as private draft: https://www.youtube.com/watch?v={video_id}")
                 except Exception as exc:  # noqa: BLE001
@@ -2081,7 +2120,68 @@ def page_render() -> None:
     with e2:
         st.markdown("**🎥 Free original motion**")
         st.caption("Each scene gets an original generated frame, then local camera movement, simulated parallax and "
-                   "atmosphere. Pexels and Pixabay footage are optional. Hosted AI video models are disabled to prevent charges.")
+                   "atmosphere. Pexels and Pixabay footage are optional.")
+    st.markdown("#### 🎬 Paid / hosted video controls")
+    setting(p, "allow_paid_video", "toggle",
+            "Enable OpenRouter paid AI video (explicitly opt in; hero scenes only)")
+    setting(p, "paid_video_provider", "select", "Paid video provider",
+            options=["openrouter"], format_func=lambda k: "OpenRouter (hosted video)")
+    setting(p, "ai_video_model", "text", "OpenRouter video model ID")
+    setting(p, "ai_video_res", "select", "Estimated resolution",
+            options=["360p", "480p", "720p", "768p", "1080p", "2K", "4K"])
+    setting(p, "paid_video_budget_usd", "number", "Per-project paid-video budget (USD)",
+            min_value=0.0, max_value=10000.0, step=0.25)
+    eligible_scenes = [sc for sc in (plan.scenes if plan else [])
+                       if sc.is_hero_scene and sc.source == "ai_video"]
+    estimate_count = len(eligible_scenes)
+    estimated_costs = []
+    if s.get("allow_paid_video") and s.get("ai_video_model"):
+        model = video.model_info(s["ai_video_model"])
+        if model:
+            aspect = "9:16" if "9:16" in str(s.get("aspect", "")) else "16:9"
+            for scene in eligible_scenes:
+                params = video.pick_params(model, scene.duration, s.get("ai_video_res", "720p"), aspect)
+                cost = video.estimate_cost(model, params["duration"], params["resolution"])
+                if cost is not None:
+                    estimated_costs.append(cost)
+    estimate_usd = round(sum(estimated_costs), 3) if len(estimated_costs) == estimate_count else None
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Eligible hero clips", estimate_count)
+    m2.metric("Visible estimate", f"${estimate_usd:.3f}" if estimate_usd is not None else "Unknown")
+    m3.metric("Budget remaining",
+              f"${max(0.0, float(s.get('paid_video_budget_usd', 0.0)) - float(s.get('paid_video_spent_usd', 0.0))):.3f}")
+    if estimate_count and estimate_usd is None:
+        st.warning("No request will run until pricing can be estimated from the selected model.")
+    if estimate_usd is not None and estimate_usd > float(s.get("paid_video_budget_usd", 0.0)):
+        st.error("Visible estimate exceeds the per-project budget; all paid calls are blocked.")
+    st.markdown("**ComfyUI & manual Flow**")
+    setting(p, "comfyui_url", "text", "ComfyUI base URL", placeholder="http://127.0.0.1:8188")
+    setting(p, "comfyui_workflow_json", "text", "ComfyUI exported API workflow JSON path")
+    setting(p, "allow_remote_comfy", "toggle",
+            "Enable remote ComfyUI tunnel (explicit opt-in; no cost check is invented)")
+    setting(p, "strict_loudness_gate", "toggle",
+            "Block export unless post-render ebur128 loudness is -15 to -13 LUFS")
+    setting(p, "license_unknown_acknowledged", "toggle",
+            "Acknowledge and permit export of assets without a complete license record")
+    if st.button("Run production preflight", disabled=running, key=f"tf_{p.id}_preflight"):
+        st.session_state[f"tf_{p.id}_preflight_result"] = render.preflight_check(
+            str(s.get("comfyui_url", "")), str(s.get("comfyui_workflow_json", "")))
+    preflight = st.session_state.get(f"tf_{p.id}_preflight_result")
+    if preflight:
+        if preflight["passed"]:
+            st.success("Required local production checks passed.")
+        else:
+            st.warning("One or more required production checks failed; local motion fallback remains available.")
+        st.dataframe(
+            [{"Check": name, "Passed": passed} for name, passed in preflight["checks"].items()],
+            hide_index=True, width="stretch",
+        )
+        st.caption(
+            f"GPU: {preflight['gpu']['name'] or 'not detected'} "
+            f"({preflight['gpu']['vram_mb'] or 'unknown'} MiB VRAM); "
+            f"OpenGL: {'available' if preflight['checks']['opengl'] else 'unavailable'}; "
+            f"ComfyUI: {preflight['comfyui_detail']}."
+        )
     st.markdown("#### 🎞️ Local scene motion engines")
     st.caption("Procedural graphics run as isolated Remotion scenes, then join the existing Timeline assembly and receive "
                "the usual captions, transitions, audio and export treatment.")
@@ -2106,6 +2206,11 @@ def page_render() -> None:
         default_video_source = setting(
             p, "default_video_source", "select", "Default videoSource for new scenes",
             options=list(VIDEO_SOURCES), format_func=lambda key: VIDEO_SOURCES[key],
+        )
+        setting(
+            p, "ai_video_fallback_source", "select", "Fallback when an AI-video scene cannot run",
+            options=["original_motion", "ai_image"],
+            format_func=lambda key: {"original_motion": "Local FFmpeg motion", "ai_image": "AI still + motion"}[key],
         )
     with apply_col:
         if st.button("Apply to all scenes", disabled=running or not plan, width="stretch"):

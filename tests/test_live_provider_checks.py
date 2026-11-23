@@ -89,7 +89,7 @@ class LiveProviderCheckTests(unittest.TestCase):
             video = Path(directory) / "video.mp4"
             video.write_bytes(b"mp4")
             thumb = Path(directory) / "thumb.jpg"
-            thumb.write_bytes(b"jpg")
+            Image.new("RGB", (8, 8), "blue").save(thumb, format="JPEG")
             captions = Path(directory) / "captions.srt"
             captions.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8")
             with patch.object(youtube_upload, "_google_modules",
@@ -103,6 +103,7 @@ class LiveProviderCheckTests(unittest.TestCase):
         self.assertEqual(service.video_endpoint.kwargs["body"]["status"]["privacyStatus"], "private")
         self.assertEqual(media_calls[0][1]["chunksize"], 8 * 1024 * 1024)
         self.assertTrue(media_calls[0][1]["resumable"])
+        self.assertEqual(media_calls[1][1]["mimetype"], "image/jpeg")
         self.assertEqual(len(media_calls), 3)
         self.assertEqual(service.caption_endpoint.kwargs["body"]["snippet"]["language"], "en")
 

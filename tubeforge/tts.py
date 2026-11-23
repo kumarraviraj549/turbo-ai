@@ -89,6 +89,8 @@ _KOKORO_MODEL_URL = ("https://github.com/thewh1teagle/kokoro-onnx/releases/downl
                      "model-files-v1.1/kokoro-v1.0.onnx")
 _KOKORO_VOICES_URL = ("https://github.com/thewh1teagle/kokoro-onnx/releases/download/"
                       "model-files-v1.1/voices-v1.0.bin")
+_KOKORO_MODEL_SHA256 = "beb0d1848dee9a49da392cc3df26958d46cfa35d321edf434f52949153f0df3a"
+_KOKORO_VOICES_SHA256 = "bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d"
 _KOKORO_INIT_LOCK = threading.Lock()
 _KOKORO_RUN_LOCK = threading.Lock()
 _KOKORO_INSTANCE = None
@@ -325,9 +327,20 @@ def _kokoro_cache_dir() -> Path:
     return root / "kokoro"
 
 
-def _download_model_file(url: str, destination: Path) -> Path:
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _download_model_file(url: str, destination: Path, expected_sha256: str) -> Path:
     if destination.exists() and destination.stat().st_size:
-        return destination
+        digest = _file_sha256(destination)
+        if digest == expected_sha256:
+            return destination
+        destination.replace(destination.with_name(f"{destination.name}.corrupt-{digest[:12]}"))
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(destination.suffix + ".part")
     try:
@@ -342,6 +355,9 @@ def _download_model_file(url: str, destination: Path) -> Path:
                 target.write(block)
         if not temporary.exists() or temporary.stat().st_size < 1024:
             raise TTSError(f"Downloaded Kokoro model file is incomplete: {destination.name}")
+        digest = _file_sha256(temporary)
+        if digest != expected_sha256:
+            raise TTSError(f"Downloaded Kokoro model file failed SHA-256 verification: {destination.name}")
         temporary.replace(destination)
         return destination
     except Exception as exc:
@@ -363,8 +379,10 @@ def _kokoro():
         except ImportError as exc:
             raise TTSError("Kokoro is not installed; install the project requirements to use local production TTS") from exc
         model_dir = _kokoro_cache_dir() / "models"
-        model = _download_model_file(_KOKORO_MODEL_URL, model_dir / "kokoro-v1.0.onnx")
-        voices = _download_model_file(_KOKORO_VOICES_URL, model_dir / "voices-v1.0.bin")
+        model = _download_model_file(_KOKORO_MODEL_URL, model_dir / "kokoro-v1.0.onnx",
+                                     _KOKORO_MODEL_SHA256)
+        voices = _download_model_file(_KOKORO_VOICES_URL, model_dir / "voices-v1.0.bin",
+                                      _KOKORO_VOICES_SHA256)
         try:
             _KOKORO_INSTANCE = Kokoro(str(model), str(voices))
         except Exception as exc:
@@ -572,12 +590,15 @@ def synthesize(
     emotion: str = "",
     log: Optional[Callable[[str], None]] = None,
     language: str = "English",
+    allow_edge_draft: bool = False,
 ) -> TTSResult:
     """Synthesizes speech with word timings; production engines preserve chunk-level resume caches."""
     text = re.sub(r"[ \t]+", " ", (text or "").strip())
     text = re.sub(r"\n{3,}", "\n\n", text)
     if not text:
         raise TTSError("empty narration")
+    if engine in ("edge", "edge_tts") and not allow_edge_draft:
+        raise TTSError("Edge TTS is draft-preview only and cannot be used for final production audio.")
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     warnings: List[str] = []
@@ -685,7 +706,8 @@ def sample(voice: str, language: str = "English", engine: str = "edge", speed: f
                "Spanish": "En un mundo de luz y sombra, una historia está a punto de comenzar."}
     out = config.CACHE_DIR / "tts_samples" / f"{engine}_{voice}_{speed}.mp3"
     if not out.exists():
-        result = synthesize(samples.get(language, samples["English"]), out, engine, voice, speed, language=language)
+        result = synthesize(samples.get(language, samples["English"]), out, engine, voice, speed,
+                            language=language, allow_edge_draft=engine in ("edge", "edge_tts"))
         if result.path.suffix.lower() != ".mp3":
             subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(result.path), "-ar", "44100", "-ac", "2",
                             "-b:a", "192k", str(out)], check=True)

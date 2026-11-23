@@ -70,6 +70,10 @@ class Scene(BaseModel):
     hero_clip: str = ""
     dialogue: List[DialogueLine] = Field(default_factory=list)
     emotion: str = ""
+    lens: str = Field(default="", description="lens or focal length, e.g. 35mm anamorphic")
+    subject: str = ""
+    action: str = ""
+    mood: str = ""
     image_prompt: str = ""
     video_prompt: str = ""
     negative_prompt: str = ""
@@ -90,7 +94,7 @@ class Scene(BaseModel):
     environment: str = ""
     stock_query: str = ""
     duration: float = 0.0
-    source: str = "original_motion"  # original_motion | ai_image | stock_video | ai_video | upload
+    source: str = "original_motion"  # original_motion | ai_image | stock_video | ai_video | comfyui_local | comfyui_remote | flow_manual | upload
     video_source: str = Field(default="original_motion", alias="videoSource")
     motion_preset: str = "dolly_in"
     depth_intensity: str = "medium"
@@ -154,7 +158,8 @@ class Scene(BaseModel):
         cue = str(self.music_cue or "").lower()
         self.music_cue = next((c for c in ("calm", "build", "climax", "tension", "resolve", "silence") if c in cue), "")
         self.overlay_kind = cinema.closest(self.overlay_kind, ["Title", "Subtitle", "Lower third", "Chapter"], "Title")
-        if self.source not in ("original_motion", "ai_image", "stock_video", "ai_video", "upload"):
+        if self.source not in ("original_motion", "ai_image", "stock_video", "ai_video",
+                               "comfyui_local", "comfyui_remote", "flow_manual", "upload"):
             self.source = "ai_image"
         if self.duration <= 0:
             self.duration = default_duration

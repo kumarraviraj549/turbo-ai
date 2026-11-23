@@ -17,14 +17,16 @@ import tempfile
 import threading
 import time
 import textwrap
+import urllib.request
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont, features
 
 from . import cinema
+from .config import CACHE_DIR
 
 LATIN_FONTS = [
     r"C:\Windows\Fonts\arialbd.ttf",
@@ -50,9 +52,15 @@ UNICODE_FONTS = [
 ]
 DEVANAGARI_FONTS = [
     r"C:\Windows\Fonts\Nirmala.ttc",
-    "/System/Library/Fonts/Kohinoor.ttc",
+    "/System/Library/Fonts/Supplemental/NotoSansDevanagari-Regular.ttf",
     "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
 ]
+DEVANAGARI_FONT_URL = (
+    "https://raw.githubusercontent.com/google/fonts/main/ofl/notosansdevanagari/"
+    "NotoSansDevanagari%5Bwdth%2Cwght%5D.ttf"
+)
+DEVANAGARI_FONT_SHA256 = "14ec4af41f27482216d1c2229f417ff9b1425e1babb014e57d1d40d03229853e"
 CJK_FONTS = [
     r"C:\Windows\Fonts\msyhbd.ttc",
     r"C:\Windows\Fonts\msyh.ttc",
@@ -67,6 +75,121 @@ class RenderError(RuntimeError):
 
 
 PIPELINE_VERSION = "lossless-assembly-v1"
+
+
+def detect_video_encoder() -> dict:
+    """Detect common hardware encoders without calling providers."""
+    result = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True,
+                            timeout=15, check=False)
+    text = (result.stdout or "") + (result.stderr or "")
+    encoders = {
+        "nvenc": "h264_nvenc" if "h264_nvenc" in text else "",
+        "qsv": "h264_qsv" if "h264_qsv" in text else "",
+        "videotoolbox": "h264_videotoolbox" if "h264_videotoolbox" in text else "",
+        "software": "libx264",
+    }
+    selected = next((value for key, value in encoders.items() if key != "software" and value), encoders["software"])
+    return {"encoders": encoders, "recommended": selected, "software_fallback": "libx264"}
+
+
+def pro_master_filter(master: str) -> str:
+    return {"prores": "prores_ks", "dnxhr": "dnxhd"}.get(str(master).strip().lower(), "")
+
+
+def detect_gpu_vram() -> Dict[str, Any]:
+    """Report available NVIDIA CUDA VRAM without making GPU support a render requirement."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(0)
+            return {"available": True, "name": props.name,
+                    "vram_mb": int(props.total_memory // (1024 * 1024)), "source": "torch"}
+    except (ImportError, OSError, RuntimeError):
+        pass
+    nvidia_smi = shutil.which("nvidia-smi")
+    if nvidia_smi:
+        try:
+            result = subprocess.run(
+                [nvidia_smi, "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5, check=True,
+            )
+            first = result.stdout.splitlines()[0].split(",", 1)
+            if len(first) == 2:
+                return {"available": True, "name": first[0].strip(),
+                        "vram_mb": int(first[1].strip()), "source": "nvidia-smi"}
+        except (OSError, subprocess.SubprocessError, IndexError, ValueError):
+            pass
+    return {"available": False, "name": "", "vram_mb": None, "source": "unavailable"}
+
+
+def measure_loudness(path: Path) -> dict:
+    """Measure EBU R128 values locally; no external API call."""
+    result = subprocess.run(
+        ["ffmpeg", "-nostats", "-i", str(path), "-filter_complex", "ebur128=peak=true",
+         "-f", "null", "-"],
+        capture_output=True, text=True, timeout=180, check=False,
+    )
+    text = (result.stdout or "") + (result.stderr or "")
+    import re
+    match = re.search(r"Integrated loudness:\s*(?:\n\s*)*I:\s*(-?\d+(?:\.\d+)?)\s*LUFS", text)
+    i = float(match.group(1)) if match else None
+    return {"integrated_lufs": i, "passed": i is not None and -15.0 <= i <= -13.0,
+            "target_lufs": -14.0}
+
+
+def preflight_check(comfy_url: str = "", workflow_path: str = "") -> dict:
+    """Useful local preflight plus an explicit, isolated ComfyUI reachability probe."""
+    import shutil
+    ffmpeg = bool(shutil.which("ffmpeg"))
+    ffprobe = bool(shutil.which("ffprobe"))
+    import importlib.util
+    cv2_available = importlib.util.find_spec("cv2") is not None
+    opengl_available = importlib.util.find_spec("OpenGL") is not None
+    if cv2_available and not opengl_available:
+        try:
+            import cv2
+            opengl_available = "OpenGL support: YES" in cv2.getBuildInformation()
+        except (ImportError, OSError):
+            pass
+    gpu = detect_gpu_vram()
+    font_ok = any(Path(font).is_file() for font in (
+        r"C:\Windows\Fonts\arial.ttf",
+        r"C:\Windows\Fonts\arialbd.ttf",
+        r"C:\Windows\Fonts\Nirmala.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    ))
+    try:
+        free_gb = shutil.disk_usage(".").free / (1024 ** 3)
+    except OSError:
+        free_gb = 0.0
+    workflow_ok = not workflow_path or Path(workflow_path).is_file()
+    comfy_reachable = False
+    comfy_detail = "not configured"
+    if comfy_url and workflow_ok:
+        try:
+            import urllib.request
+            with urllib.request.urlopen(comfy_url.rstrip("/") + "/system_stats", timeout=3) as response:
+                comfy_reachable = 200 <= int(response.status) < 300
+                comfy_detail = "reachable" if comfy_reachable else f"HTTP {response.status}"
+        except Exception as exc:
+            comfy_detail = f"unreachable: {type(exc).__name__}"
+    if not comfy_url:
+        comfy_detail = "not configured; local fallback available"
+    checks = {
+        "ffmpeg": ffmpeg, "ffprobe": ffprobe, "disk": free_gb >= 2.0,
+        "cpu_fallback_available": True,
+        "opengl": opengl_available,
+        "gpu": gpu["available"],
+        "fonts": font_ok,
+        "comfyui": not bool(comfy_url) or comfy_reachable,
+        "workflow": workflow_ok,
+    }
+    required = ("ffmpeg", "ffprobe", "disk", "comfyui", "workflow")
+    return {"passed": all(checks[key] for key in required), "checks": checks,
+            "gpu": gpu, "free_disk_gb": round(free_gb, 2),
+            "comfyui_detail": comfy_detail,
+            "encoder": detect_video_encoder()}
 
 
 _MOTION_STATUS_LOCK = threading.RLock()
@@ -118,13 +241,50 @@ def _record_motion_status(engine: str, state: str, warning: str = "") -> None:
         _MOTION_STATUS[engine] = {"state": state, "warning": warning}
 
 
+def pillow_raqm_available() -> bool:
+    return bool(features.check_feature("raqm"))
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _devanagari_font_path() -> Path:
+    for candidate in DEVANAGARI_FONTS:
+        path = Path(candidate)
+        if path.is_file():
+            return path
+    path = CACHE_DIR / "fonts" / "NotoSansDevanagari.ttf"
+    if path.is_file() and _file_sha256(path) == DEVANAGARI_FONT_SHA256:
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".part")
+    try:
+        request = urllib.request.Request(DEVANAGARI_FONT_URL, headers={"User-Agent": "TubeForgeStudio/1.0"})
+        with urllib.request.urlopen(request, timeout=30) as response, temporary.open("wb") as target:
+            shutil.copyfileobj(response, target)
+        if _file_sha256(temporary) != DEVANAGARI_FONT_SHA256:
+            raise RenderError("Downloaded Noto Sans Devanagari font failed SHA-256 verification.")
+        temporary.replace(path)
+        return path
+    except Exception as exc:
+        temporary.unlink(missing_ok=True)
+        if isinstance(exc, RenderError):
+            raise
+        raise RenderError(f"Could not obtain a Devanagari-capable font: {exc}") from exc
+
+
 class Cancelled(RuntimeError):
     pass
 
 
 def load_font(size: int, text: str = "", serif: bool = False) -> ImageFont.FreeTypeFont:
     if any("\u0900" <= ch <= "\u097f" for ch in text):
-        cands = UNICODE_FONTS + DEVANAGARI_FONTS + LATIN_FONTS
+        cands = [str(_devanagari_font_path())] + UNICODE_FONTS + LATIN_FONTS
     elif any(ord(ch) >= 0x3000 for ch in text):
         cands = UNICODE_FONTS + CJK_FONTS + LATIN_FONTS
     elif any(ord(ch) > 0x024F for ch in text):
@@ -137,7 +297,8 @@ def load_font(size: int, text: str = "", serif: bool = False) -> ImageFont.FreeT
             return _font_cache[key]
         if Path(c).exists():
             try:
-                f = ImageFont.truetype(c, size)
+                layout = ImageFont.Layout.RAQM if pillow_raqm_available() else ImageFont.Layout.BASIC
+                f = ImageFont.truetype(c, size, layout_engine=layout)
                 _font_cache[key] = f
                 return f
             except Exception:
@@ -517,6 +678,70 @@ def _layout_words(words: List[str], font, max_w: int, space: int) -> List[List[T
     return lines
 
 
+def _render_devanagari_caption_with_libass(text: str, style: str, W: int, H: int, active: int) \
+        -> Tuple[Image.Image, int, int]:
+    bold = style in ("Bold Social", "Karaoke")
+    size = max(42, int(min(W, H) * (0.095 if style == "Bold Social" else 0.075 if style != "Minimal" else 0.065)))
+    font_name = "Nirmala UI" if sys.platform == "win32" else "Noto Sans Devanagari"
+    _devanagari_font_path()
+    margin_v = int(H * (0.26 if style == "Bold Social" else 0.14))
+    words = text.split()
+    rendered_words = []
+    for index, word in enumerate(words):
+        escaped = word.replace("\\", r"\\").replace("{", r"\{").replace("}", r"\}")
+        if index == active and bold:
+            color = "&H004AD6FF" if style == "Bold Social" else "&H00FFDC78"
+            escaped = f"{{\\1c{color}\\bord3\\shad2}}{escaped}{{\\rCaption}}"
+        rendered_words.append(escaped.upper() if style == "Bold Social" else escaped)
+    line = " ".join(rendered_words)
+    with tempfile.TemporaryDirectory(prefix="tubeforge-hindi-caption-") as directory:
+        root = Path(directory)
+        ass_path = root / "caption.ass"
+        out_path = root / "caption.png"
+        ass_path.write_text(
+            "[Script Info]\nScriptType: v4.00+\n"
+            f"PlayResX: {W}\nPlayResY: {H}\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n"
+            "[V4+ Styles]\n"
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+            "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+            "Alignment, MarginL, MarginR, MarginV, Encoding\n"
+            f"Style: Caption,{font_name},{size},&H00FFFFFF,&H00FFFFFF,&HCC000000,&H88000000,"
+            f"{-1 if bold else 0},0,0,0,100,100,0,0,1,{max(2, size // 22)},2,2,80,80,{margin_v},1\n\n"
+            "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+            f"Dialogue: 0,0:00:00.00,0:00:01.00,Caption,,0,0,0,,{line}\n",
+            encoding="utf-8",
+        )
+        command = [
+            "ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+            f"color=c=black:s={W}x{H}:r=1", "-vf",
+            f"{_subtitle_filter(ass_path)},format=rgb24", "-frames:v", "1", "-pix_fmt", "rgb24", str(out_path),
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        if result.returncode:
+            raise RenderError(f"Could not shape Devanagari caption with libass: {result.stderr[-400:]}")
+        pixels = np.asarray(Image.open(out_path).convert("RGB"), dtype=np.uint8)
+        alpha = pixels.max(axis=2)
+        normalized = np.zeros_like(pixels)
+        visible = alpha > 0
+        normalized[visible] = np.minimum(
+            255, pixels[visible].astype(np.uint16) * 255 // alpha[visible, None]
+        ).astype(np.uint8)
+        caption = Image.fromarray(np.dstack((normalized, alpha)), "RGBA")
+        if style == "Minimal":
+            bounds = caption.getchannel("A").getbbox()
+            if bounds:
+                pad = int(size * 0.5)
+                background = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+                ImageDraw.Draw(background).rounded_rectangle(
+                    (max(0, bounds[0] - pad), max(0, bounds[1] - pad),
+                     min(W, bounds[2] + pad), min(H, bounds[3] + pad)),
+                    radius=int(size * 0.4), fill=(0, 0, 0, 120),
+                )
+                background.alpha_composite(caption)
+                caption = background
+        return caption, 0, 0
+
+
 def render_caption_png(words: List[str], style: str, W: int, H: int, active: int = -1) -> Tuple[Image.Image, int, int]:
     """Returns (RGBA image, x, y) for a caption chunk. active = index of highlighted word (-1 none)."""
     bold = style in ("Bold Social", "Karaoke")
@@ -524,6 +749,8 @@ def render_caption_png(words: List[str], style: str, W: int, H: int, active: int
     size = max(42, int(min_dim * (0.095 if style == "Bold Social" else 0.075 if style != "Minimal" else 0.065)))
     text_all = " ".join(words)
     font = load_font(size, text_all, serif=(style == "Cinematic"))
+    if any("\u0900" <= ch <= "\u097f" for ch in text_all) and not pillow_raqm_available():
+        return _render_devanagari_caption_with_libass(text_all, style, W, H, active)
     disp = [w.upper() for w in words] if style == "Bold Social" else list(words)
     space = int(font.getlength(" "))
     lines = _layout_words(disp, font, int(W * 0.84), space)
@@ -1379,7 +1606,7 @@ def export_final(video_in: Path, audio_in: Optional[Path], out: Path, width: int
     if fade_out > 0 and duration > fade_out * 2:
         vf.append(f"fade=t=out:st={duration - fade_out:.3f}:d={fade_out}")
     if subtitle_ass:
-        vf.append(f"subtitles=filename='{_escape_filter_path(subtitle_ass)}'")
+        vf.append(_subtitle_filter(subtitle_ass))
     vf.append("format=yuv420p")
     cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(video_in)]
     if audio_in:
@@ -1411,6 +1638,16 @@ def export_final(video_in: Path, audio_in: Optional[Path], out: Path, width: int
 def _escape_filter_path(path: Path) -> str:
     value = str(Path(path).resolve()).replace("\\", "/")
     return value.replace(":", r"\:").replace("'", r"\'").replace(",", r"\,")
+
+
+def _subtitle_filter(path: Path) -> str:
+    content = path.read_text(encoding="utf-8", errors="replace")
+    args = [f"filename='{_escape_filter_path(path)}'"]
+    if any("\u0900" <= char <= "\u097f" for char in content):
+        font_path = _devanagari_font_path()
+        if font_path.parent == CACHE_DIR / "fonts":
+            args.append(f"fontsdir='{_escape_filter_path(font_path.parent)}'")
+    return "subtitles=" + ":".join(args)
 
 
 def make_thumbnail(image_path: Path, title: str, out: Path, W: int = 1280, H: int = 720,
@@ -1527,6 +1764,12 @@ def write_kinetic_ass(words: Sequence[dict], path: Path, width: int, height: int
         if text and end > start >= 0:
             clean.append({"word": text, "start": start, "end": end})
 
+    has_devanagari = any(any("\u0900" <= char <= "\u097f" for char in item["word"]) for item in clean)
+    font_name = "Nirmala UI" if has_devanagari and sys.platform == "win32" else (
+        "Noto Sans Devanagari" if has_devanagari else "Arial"
+    )
+    if has_devanagari:
+        _devanagari_font_path()
     font_size = max(26, int(min(width, height) * (0.055 if height > width else 0.045) * style["size"]))
     margin_v = int(height * (0.17 if height > width else 0.12))
     lines = [
@@ -1541,7 +1784,7 @@ def write_kinetic_ass(words: Sequence[dict], path: Path, width: int, height: int
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding",
-        f"Style: Kinetic,Arial,{font_size},&H00FFFFFF,&H00FFFFFF,&HCC000000,&H88000000,"
+        f"Style: Kinetic,{font_name},{font_size},&H00FFFFFF,&H00FFFFFF,&HCC000000,&H88000000,"
         f"-1,0,0,0,100,100,0,0,1,2.2,1.5,2,80,80,{margin_v},1",
         "",
         "[Events]",
@@ -1694,7 +1937,7 @@ def make_vertical_teaser(video_in: Path, out: Path, title: str, seconds: float, 
           f"eq=brightness=-0.10:saturation=1.25[bg];[b]scale={W}:-2:flags=lanczos[fg];"
           f"[bg][fg]overlay=(W-w)/2:(H-h)/2[v0];[v0][1:v]overlay=0:0:shortest=1[v1];")
     if subtitle_ass:
-        fc += f"[v1]subtitles=filename='{_escape_filter_path(subtitle_ass)}'[v2];"
+        fc += f"[v1]{_subtitle_filter(subtitle_ass)}[v2];"
         vout = "[v2]"
     else:
         vout = "[v1]"
@@ -1798,7 +2041,7 @@ def make_autoclip_short(video_in: Path, out: Path, start: float, end: float,
                "-ss", f"{start:.4f}", "-i", str(video_in), "-t", f"{duration:.4f}",
                "-map", "0:v:0", "-map", "1:a:0?", "-vf",
                f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height}"
-               + (f",subtitles=filename='{_escape_filter_path(ass_path)}'" if ass_path else ""),
+               + (f",{_subtitle_filter(ass_path)}" if ass_path else ""),
                "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p",
                "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", str(out)]
         process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,

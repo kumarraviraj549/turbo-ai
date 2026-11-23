@@ -43,7 +43,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "voice_engine": "kokoro", "voice": "af_bella", "voice_speed": 1.0, "voice_pitch": 0,
     "external_voiceover_path": "",
     "dialogue_voices": True, "character_voices": {},
-    "music_mood": "ambient", "music_path": "", "music_vol": 0.35, "voice_vol": 1.0, "fx_vol": 0.5, "duck": 0.6,
+    "music_mood": "ambient", "music_path": "", "music_variation": 0,
+    "music_vol": 0.35, "voice_vol": 1.0, "fx_vol": 0.5, "duck": 0.6,
     "duck_db": -24.0,
     "ambience_on": True, "sfx_on": True, "loudness": -14.0,
     "image_engine": "auto", "openrouter_image_model": "", "allow_paid": False, "allow_stock": False,
@@ -51,12 +52,31 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "brand_primary_color": "#8B5CF6", "brand_secondary_color": "#22D3EE", "brand_accent_color": "#F472B6",
     "negative_global": "blurry, low quality, distorted, deformed, watermark, text, logo",
     "char_refs": {}, "ai_video_model": "", "ai_video_res": "720p", "ai_video_budget": 0.0,
+    "ai_video_fallback_source": "original_motion",
+    "allow_paid_video": False, "paid_video_provider": "openrouter", "paid_video_budget_usd": 0.0,
+    "paid_video_spent_usd": 0.0, "hero_video_budget_count": 0, "hero_video_budget_seconds": 0.0,
+    "hero_gpu_budget_minutes": 0.0, "comfyui_url": "", "comfyui_workflow_json": "",
+    "comfyui_remote": False, "frame_interpolation": "none", "upscale_stills": False,
+    "export_encoder": "auto", "export_bitrate_mbps": 0, "export_passes": 1,
+    "export_master": "none", "export_rec709": True, "keyframe_interval": 2,
+    "pronunciation_dictionary": {}, "pause_emphasis": {}, "enable_dubbing": False,
+    "strict_loudness_gate": True,
+    "local_music_generator": "none", "chapter_music_moods": {}, "beat_sync_cuts": False,
+    "fact_check_mode": "acknowledge", "unsupported_claim_policy": "acknowledge",
+    "live_research_enabled": False, "source_records": [],
+    "thumbnail_cutout": False, "youtube_contains_synthetic_media": False,
+    "youtube_disclosure_acknowledged": False, "youtube_playlist_id": "", "youtube_publish_at": "",
+    "subtitle_languages": [], "short_safe_zones": True,
+    "licenses": [], "license_unknown_acknowledged": False, "qa_strict": False,
+    "project_backups": 5, "rolling_backups": True,
+    "allow_remote_comfy": False, "allow_remote_comfy_budget_usd": 0.0,
     "research_notes": "",
     "channel_name": "", "channel_logo_path": "", "brand_position": "Top-Right",
     "voice_branding": True, "brand_overlay": True, "target_duration": 120.0,
     "fade_in": 0.6, "fade_out": 1.2, "workers": 3, "seed": 0, "title_card": True,
     "halation": 0.0, "gate_weave": False, "end_card": True, "end_card_cta": "", "end_card_len": 5.0,
     "shorts_teaser": True, "teaser_len": 45.0, "transition_sfx": True, "thumb_variants": True,
+    "youtube_category_id": "27", "youtube_default_language": "",
 }
 # New projects start with a richer film finish; older projects keep their look unless changed.
 NEW_PROJECT_SETTINGS = {"halation": 0.25}
@@ -74,8 +94,11 @@ def _fp(*parts) -> str:
     return hashlib.sha1(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
-def _music_seed(project_id: str) -> int:
-    return int(hashlib.sha256(f"tubeforge-music:{project_id}".encode()).hexdigest()[:16], 16)
+def _music_seed(project_id: str, variation: int = 0) -> int:
+    key = f"tubeforge-music:{project_id}"
+    if variation:
+        key += f":{int(variation)}"
+    return int(hashlib.sha256(key.encode()).hexdigest()[:16], 16)
 
 
 def _file_sig(p: str) -> str:
@@ -463,6 +486,16 @@ class Project:
                 return
             self.data["updated"] = _now()
             self.dir.mkdir(parents=True, exist_ok=True)
+            project_file = self.dir / "project.json"
+            if project_file.is_file() and bool(self.settings.get("rolling_backups", True)):
+                backup_dir = self.dir / "backups"
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                revision = int(self.data.get("rev", 0) or 0)
+                backup = backup_dir / f"project-{revision or int(_now())}.json"
+                shutil.copy2(project_file, backup)
+                keep = int(self.settings.get("project_backups", 5) or 5)
+                for old in sorted(backup_dir.glob("project-*.json"), key=lambda p: p.stat().st_mtime)[:-keep]:
+                    old.unlink(missing_ok=True)
             tmp = self.dir / f"project.json.{threading.get_ident()}.tmp"
             tmp.write_text(json.dumps(self.data, indent=1, default=str), encoding="utf-8")
             tmp.replace(self.dir / "project.json")
@@ -869,9 +902,117 @@ def ensure_visual(p: Project, sc: planner.Scene, log: Callable[[str], None],
             return "video", out
         log(f"⚠️ No stock footage for “{sc.stock_query}”, using an AI image for scene “{sc.title}”")
         src = "ai_image"
+    if src in ("comfyui_local", "comfyui_remote"):
+        fallback = s.get("ai_video_fallback_source", "original_motion")
+        if not sc.is_hero_scene:
+            log("🎥 ComfyUI true-video generation is restricted to marked hero scenes.")
+        else:
+            if src == "comfyui_remote" and not bool(s.get("allow_remote_comfy", False)):
+                log("🎥 Remote ComfyUI is disabled; enable it explicitly in project settings.")
+                src = fallback if fallback in ("original_motion", "ai_image") else "original_motion"
+                return ("image", ensure_image(p, sc, log)) if src == "ai_image" else ("image", ensure_image(p, sc, log))
+            base_url = str(s.get("comfyui_url", "")).strip()
+            workflow_path = str(s.get("comfyui_workflow_json", "")).strip()
+            if not base_url or not workflow_path:
+                log("🎥 ComfyUI source needs a URL and an exported API workflow.")
+            else:
+                try:
+                    workflow = video.import_comfy_workflow(Path(workflow_path))
+                    out = p.scene_dir(sc.id) / "comfyui.mp4"
+                    fp = _fp("comfyui", base_url, workflow_path, sc.video_prompt, st.get("seed"),
+                             sc.duration)
+                    if st.get("comfyui_fp") == fp and out.is_file():
+                        return "video", out
+                    result = video.generate_comfy_clip(
+                        base_url, workflow, out, poll_timeout=900,
+                        should_cancel=should_cancel, log=log)
+                    with p.lock:
+                        st.update(comfyui_fp=fp, ai_video=str(out))
+                    return "video", out
+                except Exception as exc:
+                    log(f"⚠️ ComfyUI unavailable; local fallback: {exc}")
+        src = fallback if fallback in ("original_motion", "ai_image") else "original_motion"
+    if src == "flow_manual":
+        if sc.is_hero_scene:
+            first = st.get("locked_image") or st.get("image")
+            if not first:
+                first = ensure_image(p, sc, log)
+            pack = p.scene_dir(sc.id) / "flow_pack.json"
+            try:
+                video.export_flow_pack(sc, Path(first), pack)
+                log(f"🧳 Flow pack ready for manual generation: {pack}")
+            except Exception as exc:
+                log(f"⚠️ Flow pack export failed: {exc}")
+            attached = sc.hero_clip or st.get("hero_clip") or st.get("flow_manual_clip")
+            if attached and Path(attached).is_file():
+                return "video", Path(attached)
+            log("🎬 Flow is manual: generate externally, then import the MP4 in the Hero Clips drawer.")
+        else:
+            log("🎥 Flow/manual true-video generation is restricted to marked hero scenes.")
+        src = s.get("ai_video_fallback_source", "original_motion")
+        if src not in ("original_motion", "ai_image"):
+            src = "original_motion"
     if src == "ai_video":
-        log(f"🎥 Hosted AI video is disabled in free-tier-only mode for “{sc.title}”; using original local motion")
-        src = "original_motion"
+        fallback = s.get("ai_video_fallback_source", "original_motion")
+        if fallback not in ("original_motion", "ai_image"):
+            fallback = "original_motion"
+        provider = str(s.get("paid_video_provider", "openrouter"))
+        if provider == "openrouter" and not bool(s.get("allow_paid_video", False)):
+            log(f"🎥 Hosted AI video is disabled unless explicitly enabled in project settings; "
+                f"using configured {fallback} fallback.")
+        elif provider == "openrouter" and sc.is_hero_scene:
+            model = str(s.get("ai_video_model", "")).strip()
+            model_data = video.model_info(model) if model else None
+            estimate = video.estimate_cost(model_data, sc.duration, s.get("ai_video_res", "720p")) \
+                if model_data else None
+            estimate_usd = float(estimate) if estimate is not None else None
+            out = p.scene_dir(sc.id) / "ai_video.mp4"
+            fp = _fp("ai_video", model, sc.video_prompt, st.get("seed"))
+            if st.get("ai_video_fp") == fp and out.is_file():
+                return "video", out
+            reserved = False
+            if estimate_usd is not None and model:
+                with p.lock:
+                    if video.can_spend_paid_video(s, estimate_usd):
+                        s["paid_video_spent_usd"] = (
+                            float(s.get("paid_video_spent_usd", 0.0)) + estimate_usd
+                        )
+                        reserved = True
+                        p.save()
+            if reserved:
+                first = st.get("locked_image") or st.get("image")
+                try:
+                    result = video.generate_ai_clip(
+                        sc.video_prompt or sc.image_prompt, out, model, sc.duration,
+                        s.get("ai_video_res", "720p"),
+                        "9:16" if "9:16" in str(s.get("aspect", "")) else "16:9",
+                        first_frame=Path(first) if first and Path(first).is_file() else None,
+                        seed=st.get("seed"), log=log, should_cancel=should_cancel,
+                    )
+                    with p.lock:
+                        cached = bool(result.get("cached", False))
+                        actual_usd = max(0.0, float(result.get("usd", 0.0) or 0.0))
+                        settled_usd = 0.0 if cached else max(estimate_usd, actual_usd)
+                        s["paid_video_spent_usd"] = max(
+                            0.0, float(s.get("paid_video_spent_usd", 0.0))
+                            - estimate_usd + settled_usd,
+                        )
+                        st.update(ai_video=str(out), ai_video_fp=fp)
+                        p.data["spent_usd"] = float(p.data.get("spent_usd", 0.0)) + settled_usd
+                        p.save()
+                    return "video", out
+                except Exception as exc:
+                    # The provider may have accepted and billed the job before the error surfaced.
+                    log(f"⚠️ Paid AI video fallback: {exc}")
+            elif not model:
+                log("🎥 Paid AI video has no model selected; using local fallback.")
+            elif estimate_usd is None:
+                log("🎥 Paid AI video cost is unknown; no paid request was made.")
+            else:
+                log("🎥 Paid AI video estimate exceeds the project USD budget; using local fallback.")
+        else:
+            log("🎥 True AI video is limited to marked hero scenes; using local fallback.")
+        src = fallback
     if src == "original_motion":
         return "image", ensure_image(p, sc, log)
     return "image", ensure_image(p, sc, log)
@@ -1173,8 +1314,6 @@ def run_plan(p: Project, ev: threading.Event, script: str = "", extra: str = "",
     for sc in plan.scenes:
         if sc.source == "ai_image" and s.get("default_source") in ("original_motion", "stock_video"):
             sc.source = s["default_source"]
-        elif sc.source == "ai_video":
-            sc.source = "original_motion"
         if sc.video_source == "original_motion" and s.get("default_video_source") in (
                 "depthflow_3d", "cutout_2d"):
             sc.video_source = s["default_video_source"]
@@ -1468,6 +1607,24 @@ def _render_hero_clip(p: Project, scene: planner.Scene, duration: float) -> Opti
     return target
 
 
+def license_audit(p: Project) -> Dict[str, Any]:
+    """Enforce that unknown asset licenses are explicitly acknowledged."""
+    registry = p.settings.get("licenses")
+    registry = registry if isinstance(registry, list) else []
+    unknown = [row for row in registry if not isinstance(row, dict)
+               or not str(row.get("license", "")).strip()
+               or str(row.get("license", "")).strip().lower() in ("unknown", "none", "unlicensed", "n/a")
+               or not str(row.get("source", "")).strip()]
+    ack = bool(p.settings.get("license_unknown_acknowledged", False))
+    if not registry:
+        unknown = []
+    blocked = bool(unknown) and not ack
+    return {"passed": not blocked, "unknown": unknown, "acknowledged": ack,
+            "blocked": blocked,
+            "detail": "Unknown licenses acknowledged." if not blocked
+            else "Unknown asset licenses require explicit acknowledgment."}
+
+
 def monetization_audit(p: Project) -> Dict[str, Any]:
     """Non-blocking readiness checks based only on persisted project settings and assets."""
     plan = p.plan
@@ -1486,6 +1643,7 @@ def monetization_audit(p: Project) -> Dict[str, Any]:
                       if str(scene.camera_move or "").strip().lower() in ("none", "static", "hold", "no movement")),
                      default=0.0)
     bible = ensure_visual_bible(p)
+    license_result = license_audit(p)
     checks = [
         {"name": "Production TTS", "passed": p.settings.get("voice_engine") not in ("edge", "edge_tts"),
          "detail": "Edge TTS is draft preview only." if p.settings.get("voice_engine") in ("edge", "edge_tts")
@@ -1504,6 +1662,8 @@ def monetization_audit(p: Project) -> Dict[str, Any]:
         {"name": "Audio mastering", "passed": abs(float(p.settings.get("loudness", -14.0)) + 14.0) <= 0.5
          and -26.0 <= float(p.settings.get("duck_db", -24.0)) <= -22.0,
          "detail": f"Target {float(p.settings.get('loudness', -14.0)):.1f} LUFS; music duck {float(p.settings.get('duck_db', -24.0)):.1f} dB."},
+        {"name": "License registry", "passed": license_result["passed"],
+         "detail": license_result["detail"]},
     ]
     return {"passed": all(item["passed"] for item in checks), "checks": checks,
             "ai_disclosure": "Stylized 2D/3D" if bible.get("visualMode") in ("stylized_2d", "stylized_3d")
@@ -1513,6 +1673,9 @@ def monetization_audit(p: Project) -> Dict[str, Any]:
 def assemble_film(p: Project, ev: threading.Event) -> None:
     plan = p.plan
     s = p.settings
+    license_result = license_audit(p)
+    if license_result["blocked"] and not s.get("license_unknown_acknowledged", False):
+        raise RuntimeError("Export blocked: unknown asset licenses require explicit acknowledgment.")
     scenes = plan.scenes
     n = len(scenes)
     clips, durs, trans = [], [], []
@@ -1685,10 +1848,21 @@ def assemble_film(p: Project, ev: threading.Event) -> None:
     user_music = Path(s["music_path"]) if s.get("music_path") and Path(s["music_path"]).exists() else None
     if mood != "none" or user_music:
         music_wav = audio.build_music(work / "music.wav", total, mood if mood != "none" else "ambient", cues,
-                                      seed=_music_seed(p.id), user_music=user_music)
+                                      seed=_music_seed(p.id, int(s.get("music_variation", 0))),
+                                      user_music=user_music)
     mix = audio.mix_final(voice_wav, music_wav, fx_wav, work / "mix.m4a", total, voice_vol=float(s["voice_vol"]),
                           music_vol=float(s["music_vol"]), fx_vol=float(s["fx_vol"]), duck=float(s["duck"]),
                           loudness=float(s["loudness"]), duck_db=float(s.get("duck_db", -24.0)))
+    if s.get("strict_loudness_gate", True):
+        loudness_result = render.measure_loudness(mix)
+        if not loudness_result["passed"]:
+            measured = loudness_result["integrated_lufs"]
+            measured_text = "unknown" if measured is None else f"{measured:.1f} LUFS"
+            if measured is not None:
+                raise RuntimeError(
+                    f"Post-render loudness gate failed: measured {measured_text}; target -14 LUFS "
+                    "(acceptable range -15 to -13 LUFS).")
+            p.log("⚠️ Post-render loudness measurement unavailable; keeping the configured -14 LUFS mix target.")
 
     stage("📦 Final encode and export", 0.95)
     ext, codec = cinema.FORMATS.get(s["format"], ("mp4", "libx264"))
@@ -1703,6 +1877,17 @@ def assemble_film(p: Project, ev: threading.Event) -> None:
                                                str(s.get("caption_preset", "Hormozi Bounce")))
     render.export_final(silent, mix, final, FW, FH, int(s["fps"]), codec, q["crf"], q["preset"],
                         float(s["fade_in"]), float(s["fade_out"]), total, subtitle_ass=kinetic_ass)
+    render_qa = quality.inspect_render(final)
+    subtitle_qa = quality.inspect_subtitle_drift(aligned_words, all_chunks, total)
+    p.data["post_render_qa"] = {
+        "render": render_qa,
+        "subtitle": subtitle_qa,
+    }
+    if s.get("qa_strict", False) and (
+            render_qa["status"] == "fail" or subtitle_qa["status"] == "review"
+            and subtitle_qa["issues"]):
+        raise RuntimeError("Post-render QA gate failed: " + " ".join(
+            render_qa["issues"] + subtitle_qa["issues"]))
     srt = render.write_srt(all_chunks, out_dir / f"{slug}.srt")
     vtt = render.write_vtt(all_chunks, out_dir / f"{slug}.vtt")
     thumb_src = next((Path(p.state(sc.id)["image"]) for sc in scenes if p.state(sc.id).get("image")
@@ -1977,4 +2162,11 @@ def package_zip(p: Project) -> Path:
         for short_path in outs.get("autoclips") or []:
             if Path(short_path).is_file():
                 z.write(short_path, f"shorts/{Path(short_path).name}")
+        z.writestr("licenses.json", json.dumps({
+            "assets": p.settings.get("licenses", []),
+            "acknowledged": bool(p.settings.get("license_unknown_acknowledged", False)),
+            "edge_tts_draft_only": p.settings.get("voice_engine") in ("edge", "edge_tts"),
+            "depthflow_license": "AGPL-3.0",
+            "anonymous_pollinations": "Review provider terms and attribution requirements",
+        }, indent=2))
     return out

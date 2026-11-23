@@ -57,6 +57,13 @@ and transition-effect placement. SRT and VTT files are included in exports. Kine
 optional Render & Export setting; they use the selected accent color and safe positioning for both landscape and
 vertical Shorts output.
 
+Hindi/Devanagari captions prefer Nirmala UI on Windows and Noto Sans Devanagari elsewhere. If no suitable system
+font is installed, TubeForge fetches the Noto Sans Devanagari variable font from Google Fonts and verifies its
+SHA-256 before use; that font is licensed under the SIL Open Font License. Pillow must be built with libraqm for
+direct complex-script shaping. Without RAQM, Hindi caption rasterization falls back to libass with the selected
+Devanagari font. The Docker image builds Pillow with libraqm and verifies that capability during image creation;
+standard Windows Pillow wheels may not include RAQM.
+
 ## Visual consistency and free-provider routing
 
 New projects use Cloudflare FLUX.1 Schnell (4 steps) first in automatic image generation, followed by anonymous

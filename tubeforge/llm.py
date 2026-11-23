@@ -1,4 +1,4 @@
-"""LLM router across Groq, OpenRouter, Google Gemini and Cloudflare Workers AI.
+"""LLM router across Groq, OpenRouter and Google Gemini.
 
 Each task type has a preferred provider order. Requests fall through to the next backend on rate limits,
 outages or invalid JSON, and backends with fatal errors (bad key, no credits) are skipped for an hour."""
@@ -13,8 +13,6 @@ from .http import ProviderError, breaker_reason, quota_cooldown, request, trip_b
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-CF_CHAT_URL = "https://api.cloudflare.com/client/v4/accounts/{acc}/ai/v1/chat/completions"
-
 GROQ_MODELS = ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "llama-3.3-70b-versatile", "openai/gpt-oss-20b"]
 GEMINI_DEFAULT_MODEL = "gemini-3.5-flash-lite"
 GEMINI_REASONING_MODEL = "gemini-3.8-flash"
@@ -27,7 +25,6 @@ GEMINI_DAILY_LIMITS = {
 GEMINI_DEFAULT_FALLBACKS = [GEMINI_DEFAULT_MODEL, "gemini-3.1-flash-lite"]
 GEMINI_REASONING_FALLBACKS = [GEMINI_REASONING_MODEL, "gemini-3.6-flash"]
 GEMINI_MODELS = list(dict.fromkeys(GEMINI_DEFAULT_FALLBACKS + GEMINI_REASONING_FALLBACKS))
-CF_MODELS = ["@cf/openai/gpt-oss-120b", "@cf/zai-org/glm-5.3-flash", "@cf/meta/llama-3.3-70b-instruct-fp8-fast"]
 # Preferred free OpenRouter models for long creative writing (largest first); discovered list is intersected.
 OPENROUTER_FREE_PREFERENCE = [
     "baidu/ernie-5.5-flash-preview:free",
@@ -178,16 +175,6 @@ def _call_openrouter(model, system, user, max_tokens, temperature, json_mode, ti
                          max_tokens, temperature, json_mode, timeout, extra)
 
 
-def _call_cloudflare(model, system, user, max_tokens, temperature, json_mode, timeout):
-    url = CF_CHAT_URL.format(acc=config.cloudflare_account())
-    extra = {"reasoning_effort": "low"} if "gpt-oss" in model else {}
-    out = _openai_style("cloudflare", url, config.cloudflare_token(), model, system, user,
-                        max_tokens, temperature, json_mode, timeout, extra)
-    # gpt-oss-120b on Workers AI: ~68k neurons per 1M output tokens.
-    cache.record_usage("cloudflare_llm", neurons=len(out) / 4 * 0.07 + len(user) / 4 * 0.032)
-    return out
-
-
 def _call_gemini(model, system, user, max_tokens, temperature, json_mode, timeout):
     limit = GEMINI_DAILY_LIMITS.get(model)
     if limit is None:
@@ -236,7 +223,6 @@ _CALLERS = {
     "groq": _call_groq,
     "openrouter": _call_openrouter,
     "gemini": _call_gemini,
-    "cloudflare": _call_cloudflare,
 }
 
 
