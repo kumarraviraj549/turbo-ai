@@ -1286,10 +1286,13 @@ def assemble_video(clips: List[Path], durations: List[float], transitions: List[
             break
     final = Path(level_clips[0])
     if final != out:
-        if level == 0:
-            subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(final), "-c", "copy", str(out)], check=True)
-        else:
-            final.replace(out)
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-nostdin", "-v", "error", "-i", str(final), "-map", "0", "-c", "copy", str(out)],
+            capture_output=True, text=True,
+        )
+        if result.returncode:
+            raise RenderError(f"Could not finalize assembled video: {_ffmpeg_reason(result.stderr)}")
+        final.unlink(missing_ok=True)
     return level_durs[0]
 
 

@@ -115,6 +115,29 @@ class VideoDecodabilityTests(unittest.TestCase):
         self.assertIsNone(export_final.call_args.kwargs["subtitle_ass"])
         write_ass.assert_not_called()
 
+    def test_multi_group_assembly_finalizes_with_stream_copy_not_path_replace(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            clips = [root / "first.mp4", root / "second.mp4"]
+            output = root / "assembled.mkv"
+
+            def finish_copy(command, **_kwargs):
+                Path(command[-1]).write_bytes(b"final video")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with patch.object(render, "_xfade_group", return_value=5.0), \
+                    patch.object(render.subprocess, "run", side_effect=finish_copy) as run_ffmpeg, \
+                    patch.object(Path, "replace", side_effect=AssertionError("Path.replace must not handle media")):
+                duration = render.assemble_video(
+                    clips, [3.0, 3.0], [("fade", 1.0)], output, 30, root / "work",
+                )
+
+            self.assertEqual(duration, 5.0)
+            command = run_ffmpeg.call_args.args[0]
+            self.assertIn("-c", command)
+            self.assertIn("copy", command)
+            self.assertIn("-nostdin", command)
+
 
 if __name__ == "__main__":
     unittest.main()
