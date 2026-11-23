@@ -45,6 +45,8 @@ class _Limiter:
 # Concurrency and pacing tuned to each provider's documented free-tier limits.
 _LIMITS = {
     "groq": (3, 0.4),
+    "groq_tts": (1, 6.0),
+    "sarvam": (2, 0.5),
     "openrouter": (4, 0.3),
     "openrouter_video": (3, 1.0),
     "cloudflare": (3, 0.25),

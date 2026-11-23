@@ -5,11 +5,19 @@ over a still image or video footage, plus procedural atmosphere (fog, rain, snow
 Stage 2 (FFmpeg filter graph): colour grade, bloom, depth of field, chromatic aberration, vignette, film grain,
 letterbox, text overlays and word-timed captions. Scenes are joined with xfade transitions."""
 import math
+import hashlib
+import importlib.util
+import json
 import random
 import re
+import shutil
 import subprocess
+import sys
+import tempfile
+import threading
+import time
 import textwrap
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -59,6 +67,55 @@ class RenderError(RuntimeError):
 
 
 PIPELINE_VERSION = "lossless-assembly-v1"
+
+
+_MOTION_STATUS_LOCK = threading.RLock()
+_MOTION_STATUS = {
+    "depthflow_3d": {"state": "not run", "warning": ""},
+    "cutout_2d": {"state": "not run", "warning": ""},
+    "procedural_3d_2d": {"state": "not run", "warning": ""},
+}
+
+
+def motion_engine_status() -> Dict[str, Dict[str, Any]]:
+    with _MOTION_STATUS_LOCK:
+        status = {name: dict(value) for name, value in _MOTION_STATUS.items()}
+    for engine, modules in (("depthflow_3d", ("depthflow",)), ("cutout_2d", ("rembg", "cv2"))):
+        status[engine]["installed"] = all(importlib.util.find_spec(module) is not None for module in modules)
+    try:
+        import cv2
+        import onnxruntime
+        cpu_depth_available = True
+    except ImportError:
+        cpu_depth_available = False
+    status["depthflow_3d"]["cpu_onnx_available"] = cpu_depth_available
+    if cpu_depth_available:
+        status["depthflow_3d"]["tiers"] = ["native_depthflow", "cpu_onnx_depth_parallax", "ffmpeg_parallax_fallback"]
+        status["depthflow_3d"]["active_tier"] = (
+            status["depthflow_3d"].get("active_tier") or "cpu_onnx_depth_parallax"
+        )
+    engine_dir = Path(__file__).resolve().parents[1] / "remotion-engine"
+    node_version = 0
+    node = shutil.which("node")
+    if node:
+        try:
+            version = subprocess.run([node, "--version"], capture_output=True, text=True, timeout=5, check=True)
+            node_version = int(re.match(r"v?(\d+)", version.stdout.strip()).group(1))
+        except (OSError, subprocess.SubprocessError, AttributeError, ValueError):
+            node_version = 0
+    status["procedural_3d_2d"]["installed"] = bool(
+        node_version >= 20 and (engine_dir / "node_modules" / "remotion").is_dir()
+    )
+    if not status["procedural_3d_2d"]["installed"] and status["procedural_3d_2d"]["state"] == "not run":
+        status["procedural_3d_2d"]["warning"] = (
+            "Node.js 20+ and remotion-engine dependencies are required to enable this engine."
+        )
+    return status
+
+
+def _record_motion_status(engine: str, state: str, warning: str = "") -> None:
+    with _MOTION_STATUS_LOCK:
+        _MOTION_STATUS[engine] = {"state": state, "warning": warning}
 
 
 class Cancelled(RuntimeError):
@@ -666,6 +723,12 @@ class SceneRenderSpec:
     sharpen: float = 0.3
     motion_blur: bool = False
     animation: str = "None"
+    video_source: str = "original_motion"
+    motion_preset: str = "dolly_in"
+    depth_intensity: str = "medium"
+    depth_dof: float = 0.15
+    scene_index: int = 1
+    procedural_props: Dict[str, Any] = field(default_factory=dict)
     halation: float = 0.0
     gate_weave: bool = False
     overlay_png: Optional[Path] = None  # full-frame RGBA overlay (end card text), fades in
@@ -771,8 +834,198 @@ def _look_filters(spec: SceneRenderSpec, mask_idx: Optional[int]) -> List[str]:
     return segs
 
 
+def _run_motion_worker(worker: Path, payload: Dict[str, Any], work: Path,
+                       should_cancel: Optional[Callable[[], bool]]) -> Dict[str, Any]:
+    if not worker.is_file():
+        raise RenderError(f"Local motion worker is missing: {worker}")
+    work.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="_motion_worker_", dir=work) as temporary_dir:
+        temporary = Path(temporary_dir)
+        config_path = temporary / "request.json"
+        stdout_path = temporary / "stdout.log"
+        stderr_path = temporary / "stderr.log"
+        config_path.write_text(json.dumps(payload), encoding="utf-8")
+        with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
+            process = subprocess.Popen(
+                [sys.executable, str(worker), str(config_path)],
+                stdin=subprocess.DEVNULL,
+                stdout=stdout,
+                stderr=stderr,
+            )
+            deadline = time.monotonic() + max(1800.0, float(payload.get("duration", 1.0)) * 120.0)
+            while process.poll() is None:
+                if should_cancel and should_cancel():
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                    raise Cancelled("render cancelled")
+                if time.monotonic() >= deadline:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                    raise RenderError("Local motion worker exceeded its render timeout")
+                time.sleep(0.2)
+        stdout_text = stdout_path.read_text(encoding="utf-8", errors="replace")
+        stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
+        result = None
+        for line in reversed(stdout_text.splitlines()):
+            try:
+                candidate = json.loads(line)
+                if isinstance(candidate, dict) and "ok" in candidate:
+                    result = candidate
+                    break
+            except json.JSONDecodeError:
+                continue
+        if process.returncode or not result or not result.get("ok"):
+            detail = (result or {}).get("error") or stderr_text.strip() or stdout_text.strip()
+            raise RenderError(f"Local motion worker failed: {detail[-700:] or 'no diagnostic output'}")
+        return result
+
+
+def _motion_output(spec: SceneRenderSpec, engine: str) -> Path:
+    scene_name = f"scene_{max(1, int(spec.scene_index)):02d}"
+    if engine == "depthflow_3d":
+        return spec.out_path.parent / f"{scene_name}_3d.mp4"
+    if engine == "procedural_3d_2d":
+        return spec.out_path.parent / f"{scene_name}_proc.mp4"
+    return spec.out_path.parent / f"{scene_name}_cutout.mp4"
+
+
+def _motion_camera(preset: str) -> str:
+    return {
+        "dolly_in": "Slow dolly in",
+        "dolly_out": "Dolly out (reveal)",
+        "orbital_left": "Orbit",
+        "orbital_right": "Orbit",
+        "circle": "Orbit",
+        "vertical_rise": "Crane up",
+    }.get(preset, "Slow dolly in")
+
+
+def _render_motion_scene(spec: SceneRenderSpec, progress: Optional[Callable[[float], None]],
+                         should_cancel: Optional[Callable[[], bool]], log: Optional[Callable[[str], None]]) -> Path:
+    engine = spec.video_source
+    work = spec.work_dir or spec.out_path.parent
+    work.mkdir(parents=True, exist_ok=True)
+    raw_output = _motion_output(spec, engine)
+    scene_name = f"scene_{max(1, int(spec.scene_index)):02d}"
+    if engine == "depthflow_3d":
+        worker = Path(__file__).resolve().parents[1] / "workers" / "depthflow_worker.py"
+        payload = {
+            "image": str(spec.source_path),
+            "depth": str(spec.out_path.parent / f"{scene_name}_depth.png"),
+            "output": str(raw_output),
+            "preset": spec.motion_preset,
+            "intensity": spec.depth_intensity,
+            "dof": spec.depth_dof,
+            "duration": spec.duration,
+            "width": spec.width,
+            "height": spec.height,
+            "fps": spec.fps,
+        }
+    elif engine == "cutout_2d":
+        worker = Path(__file__).resolve().parents[1] / "workers" / "cutout2d_worker.py"
+        payload = {
+            "image": str(spec.source_path),
+            "foreground": str(spec.out_path.parent / "foreground.png"),
+            "background": str(spec.out_path.parent / "background_clean.png"),
+            "output": str(raw_output),
+            "preset": spec.motion_preset,
+            "intensity": spec.depth_intensity,
+            "model": "birefnet-general-lite",
+            "duration": spec.duration,
+            "width": spec.width,
+            "height": spec.height,
+            "fps": spec.fps,
+        }
+    else:
+        worker = Path(__file__).resolve().parents[1] / "workers" / "procedural_worker.py"
+        payload = {
+            "image": str(spec.source_path),
+            "scene_dir": str(spec.out_path.parent),
+            "output": str(raw_output),
+            "scene_index": spec.scene_index,
+            "props": spec.procedural_props,
+            "duration": spec.duration,
+            "width": spec.width,
+            "height": spec.height,
+            "fps": spec.fps,
+        }
+
+    try:
+        if progress:
+            progress(0.05)
+        result = _run_motion_worker(worker, payload, work, should_cancel)
+        if not raw_output.is_file() or raw_output.stat().st_size == 0:
+            raise RenderError("Local motion worker did not create its scene clip")
+        if not video_is_decodable(raw_output, should_cancel):
+            raw_output.unlink(missing_ok=True)
+            raw_output.with_suffix(".json").unlink(missing_ok=True)
+            result = _run_motion_worker(worker, payload, work, should_cancel)
+            if not raw_output.is_file() or not video_is_decodable(raw_output, should_cancel):
+                raise RenderError("Local motion worker created an undecodable scene clip after retry")
+        if result.get("warning"):
+            warning = str(result["warning"])
+            _record_motion_status(engine, "fallback", warning)
+            if log:
+                log(f"⚠️ {warning}")
+        else:
+            _record_motion_status(engine, "ready")
+        if progress:
+            progress(0.55)
+    except Cancelled:
+        raise
+    except Exception as error:
+        warning = f"{engine} could not run ({type(error).__name__}: {error}); using the built-in local motion renderer."
+        _record_motion_status(engine, "fallback", warning)
+        if log:
+            log(f"⚠️ {warning}")
+        if progress:
+            progress(0.1)
+        fallback = replace(
+            spec,
+            video_source="original_motion",
+            camera=_motion_camera(spec.motion_preset),
+        )
+        return _render_scene_base(fallback, progress=progress, should_cancel=should_cancel)
+    prepared = replace(
+        spec,
+        source_type="video",
+        source_path=raw_output,
+        video_source="original_motion",
+        camera="Static (locked off)",
+        scene_index=1,
+    )
+    return _render_scene_base(
+        prepared,
+        progress=(lambda fraction: progress(0.55 + 0.45 * fraction)) if progress else None,
+        should_cancel=should_cancel,
+    )
+
+
 def render_scene(spec: SceneRenderSpec, progress: Optional[Callable[[float], None]] = None,
-                 should_cancel: Optional[Callable[[], bool]] = None) -> Path:
+                 should_cancel: Optional[Callable[[], bool]] = None,
+                 log: Optional[Callable[[str], None]] = None) -> Path:
+    """Render a scene, dispatching optional local engines with a built-in-motion fallback."""
+    if spec.video_source == "procedural_3d_2d":
+        return _render_motion_scene(spec, progress, should_cancel, log)
+    if spec.video_source in ("depthflow_3d", "cutout_2d") and spec.source_type == "image":
+        return _render_motion_scene(spec, progress, should_cancel, log)
+    if spec.video_source in ("depthflow_3d", "cutout_2d") and log:
+        log(f"⚠️ {spec.video_source} requires a still image; using the selected uploaded/stock video as-is.")
+    if spec.video_source in ("depthflow_3d", "cutout_2d"):
+        _record_motion_status(spec.video_source, "fallback", "Engine skipped because the scene source is video.")
+    return _render_scene_base(spec, progress, should_cancel)
+
+
+def _render_scene_base(spec: SceneRenderSpec, progress: Optional[Callable[[float], None]] = None,
+                       should_cancel: Optional[Callable[[], bool]] = None) -> Path:
     """Renders one scene clip (video only; audio is mixed at assembly)."""
     W, H, fps = spec.width, spec.height, spec.fps
     n_frames = max(1, int(round(spec.duration * fps)))
@@ -949,6 +1202,13 @@ def _run_ffmpeg(cmd: List[str], should_cancel: Optional[Callable[[], bool]] = No
             continue
 
 
+def video_is_decodable(path: Path, should_cancel: Optional[Callable[[], bool]] = None) -> bool:
+    """Checks the full video stream so damaged cached clips are not reused for assembly."""
+    res = _run_ffmpeg(["ffmpeg", "-v", "error", "-xerror", "-i", str(path), "-map", "0:v:0",
+                       "-f", "null", "-"], should_cancel)
+    return res.returncode == 0
+
+
 def _xfade_group(clips: List[Path], durs: List[float], trans: List[Tuple[str, float]], out: Path, fps: int,
                  size: Optional[Tuple[int, int]] = None,
                  should_cancel: Optional[Callable[[], bool]] = None) -> float:
@@ -970,13 +1230,19 @@ def _xfade_group(clips: List[Path], durs: List[float], trans: List[Tuple[str, fl
     acc = durs[0]
     for i in range(1, len(clips)):
         name, td = trans[i - 1]
-        td = max(0.04, min(td, durs[i - 1] - 0.1, durs[i] - 0.1))
-        off = acc - td
         lab = f"[x{i}]"
-        segs.append(f"{prev}settb=AVTB,fps={fps}[p{i}];[{i}:v]{norm}settb=AVTB,fps={fps}[n{i}];"
-                    f"[p{i}][n{i}]xfade=transition={name}:duration={td:.3f}:offset={off:.3f}{lab}")
+        if td <= 0.001:
+            segs.append(f"{prev}setpts=PTS-STARTPTS,settb=AVTB,fps={fps}[p{i}];"
+                        f"[{i}:v]{norm}setpts=PTS-STARTPTS,settb=AVTB,fps={fps}[n{i}];"
+                        f"[p{i}][n{i}]concat=n=2:v=1:a=0{lab}")
+            acc += durs[i]
+        else:
+            td = max(0.04, min(td, durs[i - 1] - 0.1, durs[i] - 0.1))
+            off = acc - td
+            segs.append(f"{prev}settb=AVTB,fps={fps}[p{i}];[{i}:v]{norm}settb=AVTB,fps={fps}[n{i}];"
+                        f"[p{i}][n{i}]xfade=transition={name}:duration={td:.3f}:offset={off:.3f}{lab}")
+            acc = off + durs[i]
         prev = lab
-        acc = off + durs[i]
     segs.append(f"{prev}format=yuv420p[vout]")
     cmd = ["ffmpeg", "-y", "-v", "error", *inputs, "-filter_complex", ";".join(segs), "-map", "[vout]", "-c:v",
            "ffv1", "-level", "3", "-pix_fmt", "yuv420p", "-r", str(fps), str(out)]
@@ -1027,9 +1293,70 @@ def assemble_video(clips: List[Path], durations: List[float], transitions: List[
     return level_durs[0]
 
 
+def split_video_clip(path: Path, boundaries: Sequence[float], out_dir: Path, fps: int) -> List[Path]:
+    """Re-encodes exact silent subclips at word-aligned cut points for dynamic visual pacing."""
+    path, out_dir = Path(path), Path(out_dir)
+    points = sorted({max(0.0, float(value)) for value in boundaries})
+    if len(points) < 3:
+        return [path]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    duration_probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+        capture_output=True, text=True, timeout=30,
+    )
+    try:
+        media_duration = float(duration_probe.stdout.strip())
+    except ValueError as exc:
+        raise RenderError(f"Could not read clip duration for {path.name}") from exc
+    points = [point for point in points if point < media_duration - 0.02]
+    points = [0.0] + [point for point in points if point > 0.02] + [media_duration]
+    manifest = out_dir / "beats.json"
+    signature = hashlib.sha256(
+        json.dumps({"source": str(path.resolve()), "size": path.stat().st_size,
+                    "mtime": path.stat().st_mtime_ns, "boundaries": points, "fps": fps},
+                   sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    try:
+        cached = json.loads(manifest.read_text(encoding="utf-8"))
+        cached_paths = [out_dir / item for item in cached["parts"]]
+        if (cached.get("signature") == signature and cached_paths
+                and all(item.is_file() and video_is_decodable(item) for item in cached_paths)):
+            return cached_paths
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    parts = []
+    for index, (start, end) in enumerate(zip(points, points[1:])):
+        if end - start < 0.05:
+            continue
+        out = out_dir / f"{path.stem}_beat_{index:03d}.mkv"
+        temporary = out.with_name(out.stem + ".part.mkv")
+        command = [
+            "ffmpeg", "-y", "-v", "error", "-ss", f"{start:.4f}", "-i", str(path),
+            "-t", f"{end - start:.4f}", "-an", "-vf", f"fps={fps},format=yuv420p",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", str(temporary),
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=max(120, int((end - start) * 20)))
+        if result.returncode:
+            temporary.unlink(missing_ok=True)
+            raise RenderError(f"Could not split {path.name} at a word-aligned beat: {result.stderr[-400:]}")
+        if not video_is_decodable(temporary):
+            temporary.unlink(missing_ok=True)
+            raise RenderError(f"Beat segment from {path.name} is incomplete or cannot be decoded.")
+        temporary.replace(out)
+        parts.append(out)
+    if not parts:
+        raise RenderError(f"No valid visual beat segments were created from {path.name}")
+    tmp_manifest = manifest.with_suffix(".json.tmp")
+    tmp_manifest.write_text(json.dumps({"signature": signature, "parts": [part.name for part in parts]},
+                                       indent=2), encoding="utf-8")
+    tmp_manifest.replace(manifest)
+    return parts
+
+
 def export_final(video_in: Path, audio_in: Optional[Path], out: Path, width: int, height: int, fps: int,
                  codec: str, crf: int, preset: str, fade_in: float = 0.6, fade_out: float = 1.2,
-                 duration: Optional[float] = None) -> Path:
+                 duration: Optional[float] = None, subtitle_ass: Optional[Path] = None) -> Path:
     """Final encode: optional upscale (4K), fade from/to black, audio mux, chosen container/codec."""
     vf = []
     probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
@@ -1048,6 +1375,8 @@ def export_final(video_in: Path, audio_in: Optional[Path], out: Path, width: int
         vf.append(f"fade=t=in:st=0:d={fade_in}")
     if fade_out > 0 and duration > fade_out * 2:
         vf.append(f"fade=t=out:st={duration - fade_out:.3f}:d={fade_out}")
+    if subtitle_ass:
+        vf.append(f"subtitles=filename='{_escape_filter_path(subtitle_ass)}'")
     vf.append("format=yuv420p")
     cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(video_in)]
     if audio_in:
@@ -1076,6 +1405,11 @@ def export_final(video_in: Path, audio_in: Optional[Path], out: Path, width: int
     return out
 
 
+def _escape_filter_path(path: Path) -> str:
+    value = str(Path(path).resolve()).replace("\\", "/")
+    return value.replace(":", r"\:").replace("'", r"\'").replace(",", r"\,")
+
+
 def make_thumbnail(image_path: Path, title: str, out: Path, W: int = 1280, H: int = 720,
                    channel_name: str = "", logo_path: Optional[Path] = None, hook: str = "",
                    variant: int = 0) -> Path:
@@ -1090,7 +1424,7 @@ def make_thumbnail(image_path: Path, title: str, out: Path, W: int = 1280, H: in
     draw = ImageDraw.Draw(base)
     accents = [(255, 213, 74), (83, 220, 244), (255, 126, 112)]
     accent = accents[variant % len(accents)]
-    label = textwrap.shorten(re.sub(r"\s+", " ", title.strip()), width=34, placeholder="…").upper()
+    label = ("EXPLAINED", "THE REVEAL", "NEW INSIGHT")[variant % 3]
     label_font = load_font(max(18, int(H * 0.033)), label)
     label_w = min(int(label_font.getlength(label)), int(W * 0.7))
     label_h = int(label_font.size * 1.65)
@@ -1102,7 +1436,9 @@ def make_thumbnail(image_path: Path, title: str, out: Path, W: int = 1280, H: in
 
     copy = re.sub(r"\s+", " ", (hook or title).strip())
     copy = re.split(r"(?<=[.!?])\s+|\n+", copy, maxsplit=1)[0]
-    copy = textwrap.shorten(copy, width=52, placeholder="…")
+    copy = " ".join(copy.split()[:4])
+    if len(copy.split()) < 2 or re.sub(r"\W+", "", copy).casefold() == re.sub(r"\W+", "", title).casefold():
+        copy = ("THE HIDDEN TRUTH", "WHAT HAPPENS NEXT", "THE BIG REVEAL")[variant % 3]
     copy_font_size = int(H * 0.115)
     lines = textwrap.wrap(copy, width=20, max_lines=3, placeholder="…") or [copy]
     max_width = int(W * 0.76)
@@ -1127,7 +1463,10 @@ def make_thumbnail(image_path: Path, title: str, out: Path, W: int = 1280, H: in
         b_img, bx, by = render_brand_watermark_png(W, H, False, logo_path, channel_name, "Top-Right")
         if b_img.width > 1 and b_img.height > 1:
             base.alpha_composite(b_img, (bx, by))
-    base.convert("RGB").save(out, "JPEG", quality=92)
+    if out.suffix.lower() == ".png":
+        base.save(out, "PNG", optimize=True)
+    else:
+        base.convert("RGB").save(out, "JPEG", quality=92)
     return out
 
 
@@ -1140,6 +1479,88 @@ def write_srt(chunks: List[CaptionChunk], path: Path) -> Path:
     for i, c in enumerate(chunks, 1):
         lines += [str(i), f"{ts(c.start)} --> {ts(c.end)}", " ".join(c.words), ""]
     path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+def write_vtt(chunks: List[CaptionChunk], path: Path) -> Path:
+    def ts(seconds: float) -> str:
+        ms = int(round(seconds * 1000))
+        return f"{ms // 3600000:02d}:{ms // 60000 % 60:02d}:{ms // 1000 % 60:02d}.{ms % 1000:03d}"
+
+    lines = ["WEBVTT", ""]
+    for chunk in chunks:
+        lines += [f"{ts(chunk.start)} --> {ts(chunk.end)}", " ".join(chunk.words), ""]
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+def write_kinetic_ass(words: Sequence[dict], path: Path, width: int, height: int,
+                      accent: str = "#22D3EE", preset: str = "Hormozi Bounce") -> Path:
+    """Writes one event per active word with a 2–4 word context line and a safe-zone bottom margin."""
+    preset_settings = {
+        "Hormozi Bounce": {"size": 1.12, "upper": True, "outline": 2.8, "shadow": 1.8, "chunk": 3},
+        "Clean Documentary": {"size": 0.88, "upper": False, "outline": 1.4, "shadow": 1.0, "chunk": 4},
+        "Karaoke Glow": {"size": 1.02, "upper": False, "outline": 1.8, "shadow": 2.4, "chunk": 3},
+        "Minimalist White": {"size": 0.94, "upper": False, "outline": 1.0, "shadow": 1.2, "chunk": 4},
+        "Shorts Pop": {"size": 1.24, "upper": True, "outline": 3.2, "shadow": 2.2, "chunk": 2},
+    }
+    style = preset_settings.get(preset, preset_settings["Hormozi Bounce"])
+    color = re.fullmatch(r"#?([0-9A-Fa-f]{6})", str(accent).strip())
+    rgb = color.group(1) if color else "22D3EE"
+    r, g, b = rgb[0:2], rgb[2:4], rgb[4:6]
+    ass_color = f"&H00{b}{g}{r}".upper()
+
+    def ts(value: float) -> str:
+        centis = max(0, int(round(value * 100)))
+        return f"{centis // 360000:01d}:{centis // 6000 % 60:02d}:{centis // 100 % 60:02d}.{centis % 100:02d}"
+
+    clean = []
+    for item in words:
+        try:
+            text = str(item.get("word", "")).strip()
+            start, end = float(item["start"]), float(item["end"])
+        except (AttributeError, KeyError, TypeError, ValueError):
+            continue
+        if text and end > start >= 0:
+            clean.append({"word": text, "start": start, "end": end})
+
+    font_size = max(26, int(min(width, height) * (0.055 if height > width else 0.045) * style["size"]))
+    margin_v = int(height * (0.17 if height > width else 0.12))
+    lines = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        f"PlayResX: {width}",
+        f"PlayResY: {height}",
+        "WrapStyle: 2",
+        "ScaledBorderAndShadow: yes",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+        "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+        "Alignment, MarginL, MarginR, MarginV, Encoding",
+        f"Style: Kinetic,Arial,{font_size},&H00FFFFFF,&H00FFFFFF,&HCC000000,&H88000000,"
+        f"-1,0,0,0,100,100,0,0,1,2.2,1.5,2,80,80,{margin_v},1",
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+    for index, item in enumerate(clean):
+        begin = max(0, index - 1)
+        finish = min(len(clean), index + 3)
+        finish = min(len(clean), index + int(style["chunk"]))
+        context = [w["word"] for w in clean[begin:finish]]
+        if style["upper"]:
+            context = [word.upper() for word in context]
+        active = index - begin
+        text = " ".join(context)
+        text = text.replace("\\", r"\\").replace("{", r"\{").replace("}", r"\}")
+        marked = " ".join(
+            (f"{{\\1c{ass_color}\\bord2.5\\shad2}}{word}{{\\rKinetic}}" if pos == active else word)
+            for pos, word in enumerate(text.split())
+        )
+        end = max(item["end"], item["start"] + 0.04)
+        lines.append(f"Dialogue: 0,{ts(item['start'])},{ts(end)},Kinetic,,0,0,0,,{marked}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
 
 
@@ -1228,7 +1649,8 @@ def _has_audio(path: Path) -> bool:
 
 
 def make_vertical_teaser(video_in: Path, out: Path, title: str, seconds: float, channel_name: str = "",
-                         height: int = 1920, crf: int = 20, preset: str = "medium") -> Path:
+                         height: int = 1920, crf: int = 20, preset: str = "medium",
+                         audio_in: Optional[Path] = None, subtitle_ass: Optional[Path] = None) -> Path:
     """9:16 Shorts / Reels / TikTok teaser: blurred full-bleed backdrop, the film framed in the middle,
     a bold hook title on top and a 'full film' call to action at the bottom."""
     H = 1920 if height >= 1080 else 1280
@@ -1267,11 +1689,20 @@ def make_vertical_teaser(video_in: Path, out: Path, title: str, seconds: float, 
     fc = (f"[0:v]trim=0:{seconds:.3f},setpts=PTS-STARTPTS,split[a][b];"
           f"[a]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},gblur=sigma=28,"
           f"eq=brightness=-0.10:saturation=1.25[bg];[b]scale={W}:-2:flags=lanczos[fg];"
-          f"[bg][fg]overlay=(W-w)/2:(H-h)/2[v0];[v0][1:v]overlay=0:0:shortest=1,"
-          f"fade=t=out:st={seconds - 0.8:.3f}:d=0.8,format=yuv420p[v]")
+          f"[bg][fg]overlay=(W-w)/2:(H-h)/2[v0];[v0][1:v]overlay=0:0:shortest=1[v1];")
+    if subtitle_ass:
+        fc += f"[v1]subtitles=filename='{_escape_filter_path(subtitle_ass)}'[v2];"
+        vout = "[v2]"
+    else:
+        vout = "[v1]"
+    fc += f"{vout}fade=t=out:st={seconds - 0.8:.3f}:d=0.8,format=yuv420p[v]"
     cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(video_in), "-loop", "1", "-i", str(ov_path),
            "-filter_complex", fc, "-map", "[v]"]
-    if _has_audio(video_in):
+    if audio_in and Path(audio_in).exists():
+        cmd += ["-i", str(audio_in), "-map", "2:a:0",
+                "-af", f"atrim=0:{seconds:.3f},afade=t=out:st={seconds - 1.0:.3f}:d=1.0",
+                "-c:a", "aac", "-b:a", "192k"]
+    elif _has_audio(video_in):
         cmd += ["-map", "0:a:0", "-af", f"atrim=0:{seconds:.3f},afade=t=out:st={seconds - 1.0:.3f}:d=1.0",
                 "-c:a", "aac", "-b:a", "192k"]
     cmd += ["-t", f"{seconds:.3f}", "-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p",
@@ -1280,4 +1711,128 @@ def make_vertical_teaser(video_in: Path, out: Path, title: str, seconds: float, 
     ov_path.unlink(missing_ok=True)
     if res.returncode != 0:
         raise RenderError(f"Shorts teaser failed: {res.stderr[-400:]}")
+    return out
+
+
+def make_autoclip_short(video_in: Path, out: Path, start: float, end: float,
+                        words: Optional[Sequence[dict]] = None, accent: str = "#22D3EE",
+                        caption_preset: str = "Hormozi Bounce", width: int = 1080,
+                        height: int = 1920) -> Path:
+    """Create a true 9:16 crop with smoothed face/visual-saliency focal tracking."""
+    try:
+        import cv2
+    except ImportError as exc:
+        raise RenderError("OpenCV is required for subject-aware AutoClip reframing.") from exc
+    if end <= start or start < 0:
+        raise ValueError("AutoClip end must be later than a non-negative start.")
+    cap = cv2.VideoCapture(str(video_in))
+    if not cap.isOpened():
+        raise RenderError(f"Could not open AutoClip source: {video_in}")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    source_w, source_h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    duration = end - start
+    out.parent.mkdir(parents=True, exist_ok=True)
+    crop_w = min(source_w, max(2, int(source_h * 9 / 16)))
+    face_detector = None
+    cascade_path = getattr(getattr(cv2, "data", None), "haarcascades", None)
+    if cascade_path and hasattr(cv2, "CascadeClassifier"):
+        candidate = cv2.CascadeClassifier(str(Path(cascade_path) / "haarcascade_frontalface_default.xml"))
+        if not candidate.empty():
+            face_detector = candidate
+    sample_step = max(1, int(fps / 5))
+    focal_points: List[Tuple[int, float]] = []
+    first_frame = int(start * fps)
+    last_frame = int(end * fps)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, first_frame)
+    frame_index = first_frame
+    while frame_index < last_frame:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if (frame_index - first_frame) % sample_step == 0:
+            mono = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = face_detector.detectMultiScale(
+                mono, scaleFactor=1.15, minNeighbors=4, minSize=(40, 40)
+            ) if face_detector is not None else ()
+            if len(faces):
+                x, _, face_w, _ = max(faces, key=lambda item: item[2] * item[3])
+                center_x = x + face_w / 2
+            else:
+                small = cv2.resize(mono, (256, 144), interpolation=cv2.INTER_AREA).astype(np.float32)
+                spectrum = np.fft.fft2(small)
+                log_amplitude = np.log(np.abs(spectrum) + 1e-8)
+                residual = log_amplitude - cv2.blur(log_amplitude, (3, 3))
+                saliency = np.abs(np.fft.ifft2(np.exp(residual + 1j * np.angle(spectrum)))) ** 2
+                projection = cv2.GaussianBlur(saliency.astype(np.float32), (0, 0), 3.0).mean(axis=0)
+                center_x = float(np.argmax(projection)) * source_w / 256
+            focal_points.append((frame_index, float(np.clip(center_x, crop_w / 2, source_w - crop_w / 2))))
+        frame_index += 1
+    if not focal_points:
+        cap.release()
+        raise RenderError("AutoClip source yielded no decodable frames.")
+    cap.set(cv2.CAP_PROP_POS_FRAMES, first_frame)
+    frame_index = first_frame
+    out_fps = 30.0
+    count = max(1, int(round(duration * out_fps)))
+    ass_path = None
+    with tempfile.TemporaryDirectory(prefix="tubeforge-autoclip-") as workdir:
+        if words:
+            relative_words = []
+            for item in words:
+                try:
+                    word_start, word_end = float(item["start"]), float(item["end"])
+                    text = str(item["word"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if end > word_start >= start and word_end > start:
+                    relative_words.append({"word": text, "start": max(0.0, word_start - start),
+                                           "end": min(duration, word_end - start)})
+            if relative_words:
+                ass_path = write_kinetic_ass(relative_words, Path(workdir) / "captions.ass",
+                                             width, height, accent, caption_preset)
+        cmd = ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "bgr24",
+               "-s", f"{crop_w}x{source_h}", "-r", str(out_fps), "-i", "pipe:0",
+               "-ss", f"{start:.4f}", "-i", str(video_in), "-t", f"{duration:.4f}",
+               "-map", "0:v:0", "-map", "1:a:0?", "-vf",
+               f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height}"
+               + (f",subtitles=filename='{_escape_filter_path(ass_path)}'" if ass_path else ""),
+               "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p",
+               "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", str(out)]
+        process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.PIPE)
+        prior_center = focal_points[0][1]
+        sample_cursor = 0
+        try:
+            for output_frame in range(count):
+                source_position = first_frame + int(round(output_frame * fps / out_fps))
+                while frame_index < source_position:
+                    ok, _ = cap.read()
+                    if not ok:
+                        break
+                    frame_index += 1
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                frame_index += 1
+                while sample_cursor + 1 < len(focal_points) and focal_points[sample_cursor + 1][0] <= source_position:
+                    sample_cursor += 1
+                left_point, right_point = focal_points[sample_cursor], focal_points[min(sample_cursor + 1, len(focal_points) - 1)]
+                fraction = 0.0 if right_point[0] == left_point[0] else \
+                    (source_position - left_point[0]) / (right_point[0] - left_point[0])
+                target = left_point[1] + np.clip(fraction, 0, 1) * (right_point[1] - left_point[1])
+                center = prior_center * 0.82 + target * 0.18
+                prior_center = center
+                x0 = int(np.clip(center - crop_w / 2, 0, source_w - crop_w))
+                crop = frame[:, x0:x0 + crop_w]
+                process.stdin.write(crop.tobytes())
+        except (BrokenPipeError, OSError) as exc:
+            process.kill()
+            raise RenderError("AutoClip video encoder stopped while receiving frames.") from exc
+        finally:
+            cap.release()
+            if process.stdin:
+                process.stdin.close()
+        error = process.stderr.read().decode("utf-8", errors="replace") if process.stderr else ""
+        if process.wait() != 0:
+            raise RenderError(f"Subject-aware AutoClip export failed: {error[-500:]}")
     return out

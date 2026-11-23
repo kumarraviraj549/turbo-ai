@@ -3,6 +3,10 @@ Pages (only the active one runs, so 50-scene projects stay responsive): Dashboar
 Timeline & Look, Audio, Render & Export, Providers. Long work runs as background jobs (jobs.MANAGER) and the live
 progress panel polls them with an auto-refreshing fragment."""
 import random
+import json
+import subprocess
+import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, List, Optional
@@ -12,7 +16,8 @@ import streamlit as st
 import base64
 import io
 import re
-from . import audio, cache, cinema, config, http, images, jobs, llm, planner, render, tts, video
+from . import alignment, audio, cache, cinema, config, http, images, jobs, llm, planner, procedural, render, tts, video
+from . import youtube_upload
 
 CSS = """
 <style>
@@ -59,10 +64,16 @@ PAGES = ["🏠 Dashboard", "✨ Create", "📖 Story", "🎞️ Storyboard", "�
 STEPS = ["Idea", "Story", "Characters", "Scenes", "Visuals", "Voice", "Music", "Edit", "Render", "Export"]
 STATUS_ICON = {"pending": "⏳", "visual": "🖼️", "voice": "🎙️", "rendering": "🎬", "done": "✅", "error": "❌",
                "cancelled": "⏹️", "assets": "📦"}
-SOURCES = {"ai_image": "AI image + camera move", "stock_video": "Stock footage (Pixabay)",
+SOURCES = {"ai_image": "AI image + camera move", "stock_video": "Stock footage (Pixabay + Pexels)",
            "original_motion": "Original AI scene + free local motion",
            "ai_video": "Hosted AI video (disabled in free mode)", "upload": "My upload"}
 FREE_SOURCES = ["original_motion", "ai_image", "stock_video", "upload"]
+VIDEO_SOURCES = {
+    "original_motion": "Built-in FFmpeg parallax",
+    "depthflow_3d": "DepthFlow 3D depth parallax",
+    "cutout_2d": "2D layered cutout",
+    "procedural_3d_2d": "Remotion procedural 3D/2D graphics",
+}
 DURATION_PRESETS = [
     ("⚡ 30s Short (Fast Hook)", 30.0, 4),
     ("⏱️ 1 Minute (60s Quick Story)", 60.0, 8),
@@ -226,6 +237,35 @@ def _visual_qa_panel(p: jobs.Project) -> None:
         st.warning(issue)
     if not qa.get("issues"):
         st.caption("No low-detail, near-duplicate, or missing recurring-character reference warnings were found.")
+
+
+def _alignment_beats_panel(p: jobs.Project) -> None:
+    path = p.dir / "alignment.json"
+    if not path.is_file():
+        return
+    try:
+        words = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        st.warning("The saved word alignment could not be read.")
+        return
+    beats = p.data.get("visual_beats") or alignment.dynamic_beats(words)
+    if not beats:
+        return
+    hook = [beat for beat in beats if beat["start"] < 30.0]
+    body = [beat for beat in beats if beat["start"] >= 30.0]
+    max_hook = max((beat["end"] - beat["start"] for beat in hook), default=0.0)
+    max_body = max((beat["end"] - beat["start"] for beat in body), default=0.0)
+    st.caption(
+        f"Word-aligned pacing map: {len(beats)} beats · hook max {max_hook:.1f}s / 4.5s · "
+        f"body max {max_body:.1f}s / 7.0s. Transition effects are placed at these word boundaries."
+    )
+    with st.expander("Preview aligned visual beats"):
+        st.dataframe(
+            [{"Start": round(beat["start"], 2), "End": round(beat["end"], 2),
+              "Duration": round(beat["end"] - beat["start"], 2), "Visual cue": beat["text"]}
+             for beat in beats],
+            hide_index=True, width="stretch",
+        )
 
 
 def _est_runtime(p: jobs.Project, plan: planner.CinematicPlan) -> float:
@@ -428,6 +468,31 @@ def page_create() -> None:
             placeholder="Paste verified facts and the URLs/titles they came from. The planner will be told not to invent citations.",
             disabled=running,
         )
+        st.caption("Import an article or transcript to extract source-bounded facts and statistics.")
+        import_url = st.text_input("Article URL (optional)", key=f"tf_import_url_{_pid()}")
+        import_text = st.text_area("Or paste article / transcript text", height=90,
+                                   key=f"tf_import_text_{_pid()}", disabled=running)
+        if st.button("Import source facts", key=f"tf_import_source_{_pid()}", disabled=running):
+            try:
+                source_text = jobs.fetch_article_text(import_url.strip()) if import_url.strip() else import_text.strip()
+                if not source_text:
+                    raise ValueError("Paste article or transcript text, or provide an article URL.")
+                source_label = import_url.strip() or "User-provided transcript"
+                extracted = planner.extract_verified_facts(source_text, source_label)
+                fact_text = "Imported source facts:\n" + "\n".join(
+                    f"- {fact['statement']} [Source: {fact['citation']}]"
+                    for fact in extracted.get("facts", [])
+                )
+                if extracted.get("key_statistics"):
+                    fact_text += "\nKey statistics:\n" + json.dumps(
+                        extracted["key_statistics"], ensure_ascii=False
+                    )
+                st.session_state[f"tf_imported_research_{_pid() or 'new'}"] = fact_text
+                _flash(f"Imported {len(extracted.get('facts', []))} source-grounded facts")
+                st.rerun()
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Source import failed: {exc}")
+        imported_research = st.session_state.get(f"tf_imported_research_{_pid() or 'new'}", "")
 
     if not p:
         st.markdown("#### 2 · Target Duration & Timeline Pacing")
@@ -508,17 +573,21 @@ def page_create() -> None:
             go_plan = go_full = False  # double-click: the project was already created a moment ago
         if go_plan or go_full:
             st.session_state["tf_last_create"] = (idea.strip(), time.time())
-            voice = tts.voice_options(lang)[0][0]
+            voice_engine = "kokoro" if lang == "English" else (
+                "sarvam" if lang == "Hindi" and config.sarvam_key() else "edge"
+            )
+            voice = tts.voice_options(lang, voice_engine)[0][0]
+            combined_research = "\n\n".join(part for part in (research_notes.strip(), imported_research) if part)
             pr = jobs.create_project(idea.strip(), {
                 "style": style, "scene_count": n, "scene_duration": float(dur),
                 "target_duration": float(target_sec),
-                "aspect": aspect, "language": lang, "voice": voice,
+                "aspect": aspect, "language": lang, "voice": voice, "voice_engine": voice_engine,
                 "channel_name": channel_name.strip(),
                 "brand_position": brand_pos,
                 "voice_branding": voice_branding,
                 "brand_overlay": brand_overlay,
                 "default_source": default_src,
-                "research_notes": research_notes,
+                "research_notes": combined_research,
             })
             saved_logo_path = saved_bp.get("channel_logo_path", "")
             if logo_up is not None:
@@ -552,8 +621,13 @@ def page_create() -> None:
     if idea.strip() and idea.strip() != p.data["idea"] and not running:
         p.data["idea"] = idea.strip()
         p.save()
-    if research_notes != p.settings.get("research_notes", ""):
-        p.settings["research_notes"] = research_notes
+    imported_research = st.session_state.get(f"tf_imported_research_{p.id}", "")
+    if research_notes != p.settings.get("research_notes", "") or (
+            imported_research and imported_research not in p.settings.get("research_notes", "")):
+        base_research = research_notes.strip()
+        if imported_research and imported_research not in base_research:
+            base_research = "\n\n".join(part for part in (base_research, imported_research.strip()) if part)
+        p.settings["research_notes"] = base_research
         p.save()
 
     st.markdown("#### 2 · Target Duration & Timeline Pacing")
@@ -711,11 +785,37 @@ def page_story() -> None:
             p.save()
             _flash("Story saved")
             st.rerun()
+    st.markdown("#### 📊 Story motion-graphic treatment")
+    st.caption("Planner-suggested factual beats are retained automatically. You can also apply a template to selected scenes.")
+    with st.container(border=True):
+        story_scenes = st.multiselect(
+            "Story scenes",
+            options=[scene.id for scene in plan.scenes],
+            default=[scene.id for scene in plan.scenes if scene.video_source == "procedural_3d_2d"],
+            format_func=lambda scene_id: next(
+                (f"{index + 1}. {scene.title}" for index, scene in enumerate(plan.scenes) if scene.id == scene_id),
+                scene_id,
+            ),
+            key=f"tf_{p.id}_story_procedural_scenes",
+        )
+        template = st.selectbox("Procedural template", procedural.TEMPLATES,
+                                key=f"tf_{p.id}_story_procedural_template")
+        if st.button("Apply template to selected story scenes", disabled=running or not story_scenes):
+            for scene in plan.scenes:
+                if scene.id in story_scenes:
+                    scene.video_source = "procedural_3d_2d"
+                    if scene.procedural_template != template:
+                        scene.procedural_props = {}
+                    scene.procedural_template = template
+            p.set_plan(plan)
+            p.save()
+            _flash(f"Applied {template} to {len(story_scenes)} scene(s)")
+            st.rerun()
     st.markdown("#### 🎭 Characters: consistent looks and reference images")
     st.caption("Each scene prompt repeats the character's look text. A reference image is also sent to engines that "
                "support references (Cloudflare FLUX.2, OpenRouter, Gemini) for stronger consistency.")
     refs = p.settings.get("char_refs") or {}
-    voices = tts.voice_options(p.settings["language"])
+    voices = tts.voice_options(p.settings["language"], p.settings.get("voice_engine", "edge"))
     vlabels = {v: lab for v, lab in voices}
     for ci, ch in enumerate(plan.characters):
         with st.container(border=True):
@@ -795,6 +895,8 @@ def _scene_editor(p: jobs.Project, plan: planner.CinematicPlan, i: int, running:
     sc = plan.scenes[i]
     st_ = p.state(sc.id)
     rev = p.data.get("rev", 0)
+    bible = jobs.ensure_visual_bible(p)
+    visual_locked = not bible.get("required") or bible.get("approved")
     status = st_.get("status", "pending")
     head = f"{STATUS_ICON.get(status, '•')} Scene {i + 1} · {sc.title or 'Untitled'} · {sc.duration:.0f}s · {SOURCES.get(sc.source, sc.source)}"
     with st.expander(head, expanded=st.session_state.get("tf_open_scene") == sc.id):
@@ -815,6 +917,8 @@ def _scene_editor(p: jobs.Project, plan: planner.CinematicPlan, i: int, running:
             meta = []
             if st_.get("image_engine"):
                 meta.append(f"image: {images.ENGINES[st_['image_engine']].label if st_['image_engine'] in images.ENGINES else st_['image_engine']}")
+            if st_.get("image_credit"):
+                meta.append(st_["image_credit"])
             if st_.get("locked_image"):
                 meta.append("🔒 locked image")
             if st_.get("stock_credit"):
@@ -872,6 +976,38 @@ def _scene_editor(p: jobs.Project, plan: planner.CinematicPlan, i: int, running:
                 negative = n1.text_input("Negative prompt", sc.negative_prompt)
                 stock_q = n2.text_input("Stock footage keywords", sc.stock_query)
                 video_prompt = st.text_input("Motion direction (local free motion)", sc.video_prompt)
+                mv1, mv2, mv3, mv4 = st.columns(4)
+                video_source_value = sc.video_source if sc.video_source in VIDEO_SOURCES else "original_motion"
+                video_source = mv1.selectbox(
+                    "Scene motion engine", list(VIDEO_SOURCES),
+                    index=list(VIDEO_SOURCES).index(video_source_value),
+                    format_func=lambda key: VIDEO_SOURCES[key],
+                )
+                preset_value = sc.motion_preset if sc.motion_preset in jobs.MOTION_PRESETS else "dolly_in"
+                motion_preset = mv2.selectbox("Motion preset", list(jobs.MOTION_PRESETS),
+                                              index=list(jobs.MOTION_PRESETS).index(preset_value))
+                intensity_value = sc.depth_intensity if sc.depth_intensity in ("subtle", "medium", "cinematic") else "medium"
+                depth_intensity = mv3.selectbox("Depth intensity", ["subtle", "medium", "cinematic"],
+                                                index=["subtle", "medium", "cinematic"].index(intensity_value))
+                depth_dof = mv4.slider("DepthFlow DOF", 0.0, 1.0, max(0.0, min(1.0, float(sc.depth_dof))), 0.05,
+                                       help="Subtle lens blur for the DepthFlow 3D engine.")
+                procedural_template = st.selectbox(
+                    "Motion-graphic template", procedural.TEMPLATES,
+                    index=procedural.TEMPLATES.index(sc.procedural_template)
+                    if sc.procedural_template in procedural.TEMPLATES else 0,
+                    disabled=video_source != "procedural_3d_2d",
+                )
+                procedural_props_text = ""
+                if video_source == "procedural_3d_2d":
+                    procedural_props_text = st.text_area(
+                        "Template props (strict JSON)",
+                        json.dumps(sc.procedural_props, ensure_ascii=False, indent=2),
+                        height=150,
+                        help="Edit template-specific fields as JSON. Brand colors, channel name, title, aspect and duration "
+                             "are inherited from the project and scene.",
+                    )
+                    st.caption("Supported: 3d_bar_chart, 3d_stat_callout, comparison_split, timeline_journey, "
+                               "process_flow, quote_evidence_card. Evidence citations must match Story research sources.")
                 g1, g2, g3, g4 = st.columns(4)
                 cam = g1.selectbox("Camera move", list(cinema.CAMERA_MOVES), index=list(cinema.CAMERA_MOVES).index(sc.camera_move))
                 shot = g2.selectbox("Shot", cinema.SHOT_TYPES, index=cinema.SHOT_TYPES.index(sc.shot_type))
@@ -900,21 +1036,41 @@ def _scene_editor(p: jobs.Project, plan: planner.CinematicPlan, i: int, running:
                 notes = st.text_input("Director notes for AI rewrite / enhance (optional)",
                                       placeholder="more tension, show the robot's face, rain at night…")
                 b = st.columns(5)
-                refresh = b[0].form_submit_button("↻ Refresh scene", disabled=running, width="stretch")
+                refresh = b[0].form_submit_button("↻ Refresh scene", disabled=running or not visual_locked,
+                                                  width="stretch")
                 save = b[1].form_submit_button("💾 Save", type="primary", disabled=running, width="stretch")
-                gen = b[2].form_submit_button("🖼️ New image", disabled=running, width="stretch")
-                var = b[3].form_submit_button("🎲 3 variations", disabled=running, width="stretch")
-                rend = b[4].form_submit_button("🎬 Render clip", disabled=running, width="stretch")
-                b2 = st.columns(3)
+                gen = b[2].form_submit_button("🖼️ New image", disabled=running or not visual_locked, width="stretch")
+                var = b[3].form_submit_button("🎲 3 variations", disabled=running or not visual_locked,
+                                              width="stretch")
+                rend = b[4].form_submit_button("🎥 Preview this scene", disabled=running or not visual_locked,
+                                               width="stretch")
+                b2 = st.columns(4)
                 enh = b2[0].form_submit_button("✨ Enhance prompt", disabled=running, width="stretch")
                 rew = b2[1].form_submit_button("🤖 Rewrite scene (AI)", disabled=running, width="stretch")
                 voi = b2[2].form_submit_button("🔊 Preview voice", disabled=running, width="stretch")
-                st.caption("Refresh generates a new frame and scene preview. Render the full film afterward to update the export.")
-            if refresh or save or gen or var or rend or enh or rew or voi:
+                proc_preview = b2[3].form_submit_button(
+                    "🧊 Motion still", disabled=running or video_source != "procedural_3d_2d", width="stretch",
+                )
+                st.caption("Preview renders only this scene at the current output size. Render the full film afterward to update the export.")
+            if refresh or save or gen or var or rend or enh or rew or voi or proc_preview:
+                parsed_proc_props = None
+                if video_source == "procedural_3d_2d":
+                    try:
+                        parsed_proc_props = json.loads(procedural_props_text or "{}")
+                        if not isinstance(parsed_proc_props, dict):
+                            raise ValueError("Template props must be a JSON object.")
+                    except (json.JSONDecodeError, ValueError) as error:
+                        _flash(f"Invalid procedural props: {error}", "error")
+                        return
                 st.session_state["tf_open_scene"] = sc.id
                 sc.title, sc.source, sc.duration, sc.narration = title, source, float(duration), narration
                 sc.dialogue = planner.Scene(dialogue=dialogue).dialogue
                 sc.image_prompt, sc.negative_prompt, sc.stock_query, sc.video_prompt = image_prompt, negative, stock_q, video_prompt
+                sc.video_source, sc.motion_preset = video_source, motion_preset
+                sc.depth_intensity, sc.depth_dof = depth_intensity, float(depth_dof)
+                sc.procedural_template = procedural_template
+                if parsed_proc_props is not None:
+                    sc.procedural_props = parsed_proc_props
                 sc.camera_move, sc.shot_type, sc.camera_angle, sc.lighting = cam, shot, angle, light
                 sc.atmosphere, sc.color_grade, sc.animation, sc.transition = atmo, grade, anim, trans
                 sc.music_cue, sc.sfx, sc.ambience, sc.overlay_kind, sc.overlay_text = cue, sfx, amb, okind, overlay
@@ -973,12 +1129,21 @@ def _scene_editor(p: jobs.Project, plan: planner.CinematicPlan, i: int, running:
                             st.session_state[f"tf_voice_{sc.id}"] = [x["path"] for x in parts]
                         except Exception as e:  # noqa: BLE001
                             _flash(f"Voice failed: {e}", "error")
+                elif proc_preview:
+                    jobs.MANAGER.start_task(
+                        p, "procedural_preview",
+                        lambda pr, ev, sid=sc.id: jobs.preview_procedural_scene(pr, sid, ev.is_set),
+                    )
+                    st.session_state[f"tf_was_running_{p.id}"] = True
                 elif save:
                     _flash(f"Scene {i + 1} saved")
                 st.rerun()
             for vp in st.session_state.get(f"tf_voice_{sc.id}", []):
                 if Path(vp).exists():
                     st.audio(vp)
+            preview_image = p.scene_dir(sc.id) / f"scene_{i + 1:02d}_procedural_preview.png"
+            if preview_image.is_file():
+                st.image(str(preview_image), caption="Remotion frame preview", width="stretch")
             m = st.columns(5)
             if m[0].button("⬆️ Up", key=f"tf_{p.id}_up_{sc.id}", disabled=running or i == 0, width="stretch") and i > 0:
                 plan.scenes[i - 1], plan.scenes[i] = plan.scenes[i], plan.scenes[i - 1]
@@ -1004,6 +1169,205 @@ def _scene_editor(p: jobs.Project, plan: planner.CinematicPlan, i: int, running:
                 p.set_plan(plan); p.save(); st.rerun()  # noqa: E702
 
 
+def _visual_bible_panel(p: jobs.Project, running: bool) -> None:
+    bible = jobs.ensure_visual_bible(p)
+    st.markdown("#### 🎨 Generate & Lock Visual Bible")
+    st.caption("Set one visual mode, locked style prefix, negative prompt, and project seed. Generate a master style "
+               "reference and character sheets, review them, then approve before batch scene images use them.")
+    revision = f"{p.data.get('rev', 0)}_{p.data.get('visualBibleRevision', 0)}"
+    modes = ["stylized_3d", "stylized_2d", "cinematic_doc"]
+    mode_labels = {"stylized_3d": "Stylized 3D", "stylized_2d": "Stylized 2D",
+                   "cinematic_doc": "Cinematic documentary"}
+    with st.form(f"tf_{p.id}_visual_bible_{revision}"):
+        mode = st.selectbox("Visual mode", modes, index=modes.index(bible["visualMode"]),
+                            format_func=lambda value: mode_labels[value])
+        prefix = st.text_area("Locked style prefix", bible.get("stylePrefix", ""), height=90,
+                              help="Lighting, lens, texture, and palette guidance repeated on each scene prompt.")
+        negative = st.text_area("Global negative prompt", bible.get("globalNegativePrompt", ""), height=60)
+        seed_base = st.number_input("Project seed", min_value=0, max_value=2 ** 31 - 2,
+                                    value=int(bible["seedBase"]), step=1)
+        save_draft = st.form_submit_button("Save Visual Bible draft", disabled=running)
+        generate = st.form_submit_button("Generate Visual Bible references", type="primary", disabled=running)
+    if save_draft or generate:
+        changed = (mode != bible["visualMode"] or prefix != bible.get("stylePrefix", "")
+                   or negative != bible.get("globalNegativePrompt", "")
+                   or int(seed_base) != int(bible["seedBase"]))
+        bible.update(visualMode=mode, stylePrefix=prefix, globalNegativePrompt=negative, seedBase=int(seed_base))
+        if changed:
+            bible["approved"] = False
+        p.data["visualBibleRevision"] = int(p.data.get("visualBibleRevision", 0)) + 1
+        p.save()
+        if generate:
+            jobs.MANAGER.start_task(p, "visual_bible",
+                                    lambda project, _event: jobs.generate_visual_bible(project, project.log))
+            st.session_state[f"tf_was_running_{p.id}"] = True
+        st.rerun()
+
+    bible = jobs.ensure_visual_bible(p)
+    master = bible.get("masterReferencePath", "")
+    master_ready = bool(master and Path(master).is_file())
+    chars_ready = all(not item.get("name") or (item.get("referenceImagePath")
+                      and Path(item["referenceImagePath"]).is_file()) for item in bible.get("characters", []))
+    refs_current = bible.get("generatedFingerprint") == jobs.visual_bible_fingerprint(bible)
+    if master_ready:
+        st.image(master, caption="Master style reference", width="stretch")
+    if bible.get("characters"):
+        columns = st.columns(min(4, len(bible["characters"])))
+        for index, character in enumerate(bible["characters"]):
+            with columns[index % len(columns)]:
+                path = character.get("referenceImagePath", "")
+                if path and Path(path).is_file():
+                    st.image(path, caption=character.get("name", "Character"), width="stretch")
+                else:
+                    st.caption(f"{character.get('name', 'Character')}: reference not generated")
+    if bible.get("approved"):
+        st.success("Visual Bible approved and locked. Its prefix, seed, and available references will be used for scene images.")
+    elif master_ready and chars_ready and refs_current:
+        if st.button("✅ Approve & Lock Visual Bible", key=f"tf_{p.id}_visual_bible_approve", disabled=running):
+            bible["approved"] = True
+            p.data["visualBibleRevision"] = int(p.data.get("visualBibleRevision", 0)) + 1
+            p.save()
+            st.rerun()
+    elif master_ready and chars_ready:
+        st.warning("Visual Bible settings changed since these references were generated. Regenerate references before approval.")
+    if master_ready and st.button("🔁 Regenerate Visual Bible references", key=f"tf_{p.id}_visual_bible_regen",
+                                  disabled=running):
+        bible["seedBase"] = (int(bible["seedBase"]) + 7919) % (2 ** 31 - 1) or 1
+        bible["approved"] = False
+        p.data["visualBibleRevision"] = int(p.data.get("visualBibleRevision", 0)) + 1
+        p.save()
+        jobs.MANAGER.start_task(p, "visual_bible",
+                                lambda project, _event: jobs.generate_visual_bible(project, project.log, regenerate=True))
+        st.session_state[f"tf_was_running_{p.id}"] = True
+        st.rerun()
+
+
+def _channel_library_panel(p: jobs.Project, running: bool) -> None:
+    name = str(p.settings.get("channel_name", "")).strip()
+    with st.expander("🎨 Channel Asset Library & Series Memory", expanded=False):
+        if not name:
+            st.info("Set a Channel Name in Create before saving or loading reusable channel assets.")
+        else:
+            history = jobs.load_series_history(name)
+            st.caption(f"Library: {jobs.channel_dir(name) / 'library.json'} · "
+                       f"series memory: {len(history)} completed project(s), last 25 injected during planning.")
+            save_col, load_col = st.columns(2)
+            if save_col.button("Save Visual Bible, palette & voice", key=f"tf_{p.id}_lib_save",
+                               disabled=running or not p.plan):
+                try:
+                    path = jobs.save_project_channel_library(p)
+                    _flash(f"Saved channel assets to {path}")
+                    st.rerun()
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Could not save channel assets: {exc}")
+            if load_col.button("Load channel assets into project", key=f"tf_{p.id}_lib_load",
+                               disabled=running):
+                try:
+                    if jobs.apply_channel_library(p):
+                        _flash("Channel assets loaded and saved to project state")
+                        st.rerun()
+                    else:
+                        st.warning("No Visual Bible is saved for this channel yet.")
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Could not load channel assets: {exc}")
+            if history:
+                st.dataframe([{"Title": item.get("title", ""), "Topic": item.get("topic", ""),
+                               "Opening hook": item.get("opening_hook", "")} for item in history[-5:]],
+                             hide_index=True, width="stretch")
+
+
+def _style_reference_panel(p: jobs.Project, running: bool) -> None:
+    with st.expander("🧭 Screenshot-to-Original-Style Extractor", expanded=False):
+        st.caption("Upload 1–3 references. Gemini derives broad visual qualities and invents an original identity; "
+                   "it is instructed not to reproduce characters, logos, or distinctive compositions.")
+        uploads = st.file_uploader("Reference screenshots", type=["png", "jpg", "jpeg", "webp"],
+                                   accept_multiple_files=True, key=f"tf_{p.id}_style_refs",
+                                   disabled=running)
+        if st.button("Extract original Visual Bible", key=f"tf_{p.id}_extract_style",
+                     disabled=running or not uploads):
+            saved = []
+            try:
+                if not 1 <= len(uploads) <= 3:
+                    raise ValueError("Choose one to three screenshots.")
+                for index, upload in enumerate(uploads):
+                    saved.append(Path(_save_upload(p, upload, "style_references", f"reference_{index + 1}")))
+                extracted = images.extract_original_style(saved)
+                bible = jobs.ensure_visual_bible(p)
+                bible["stylePrefix"] = ". ".join(str(extracted.get(key, "")).strip() for key in
+                                                 ("art_medium", "lighting", "style_prefix") if extracted.get(key))
+                bible["globalNegativePrompt"] = str(extracted.get("global_negative_prompt") or
+                                                    jobs.VISUAL_BIBLE_NEGATIVE)
+                bible["styleExtraction"] = extracted
+                bible["approved"] = False
+                character = extracted.get("original_character") or {}
+                if isinstance(character, dict) and character.get("name"):
+                    bible["characters"] = (bible.get("characters") or []) + [{
+                        "id": re.sub(r"[^a-z0-9]+", "-", str(character["name"]).lower()).strip("-"),
+                        "name": str(character["name"]), "look": str(character.get("description", "")),
+                    }]
+                palette = extracted.get("palette") or []
+                palette_keys = ("brand_primary_color", "brand_secondary_color", "brand_accent_color")
+                for key, color in zip(palette_keys, palette):
+                    if re.fullmatch(r"#[0-9A-Fa-f]{6}", str(color)):
+                        p.settings[key] = color
+                p.data["visualBible"] = bible
+                p.data["visualBibleRevision"] = int(p.data.get("visualBibleRevision", 0)) + 1
+                p.save()
+                st.success("Original style extracted. Review it, then approve and lock the Visual Bible.")
+                st.json(extracted)
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Style extraction failed: {exc}")
+
+
+def _hero_clips_panel(p: jobs.Project, running: bool) -> None:
+    with st.expander("🎞️ Hero Clips Drawer (Free Motion Hook)", expanded=False):
+        if not p.plan:
+            st.info("Generate a storyboard first.")
+            return
+        if not any(scene.is_hero_scene for scene in p.plan.scenes):
+            jobs.flag_hero_scenes(p.plan)
+            p.set_plan(p.plan)
+            p.save()
+        rows = jobs.hero_beat_rows(p)
+        hero_rows = [item for item in rows if item.get("is_hero_scene")]
+        prompts = "\n\n".join(re.sub(r"\s+", " ", str(item.get("visual_prompt") or item.get("text") or "")).strip()
+                              for item in hero_rows)
+        st.caption("Copy the clean hero prompts, then attach any externally generated MP4 to its scene. Imported clips "
+                   "are normalized and used in final assembly; the generated scene remains cached for resume.")
+        if prompts:
+            st.code(prompts, language=None)
+        for item in hero_rows:
+            index = int(item["scene_index"])
+            st.markdown(f"**Hero {index + 1}: {_esc(item.get('title', 'Scene'))}** · "
+                        f"{_fmt_time(item['start'])}–{_fmt_time(item['end'])}")
+            uploaded = st.file_uploader("Drop an MP4 hero clip here", type=["mp4", "mov", "m4v"],
+                                        key=f"tf_{p.id}_hero_upload_{index}", disabled=running)
+            if uploaded is not None and st.button("Attach clip", key=f"tf_{p.id}_hero_attach_{index}",
+                                                  disabled=running):
+                try:
+                    path = jobs.attach_hero_clip(p, index, uploaded.getvalue(), uploaded.name)
+                    _flash(f"Attached hero clip: {path.name}")
+                    st.rerun()
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Hero clip import failed: {exc}")
+            clip = item.get("hero_clip")
+            if clip and Path(clip).is_file():
+                st.video(clip)
+                if st.button("Extract Last Frame PNG", key=f"tf_{p.id}_hero_frame_{index}", disabled=running):
+                    try:
+                        frame = Path(clip).with_name(Path(clip).stem + "_last_frame.png")
+                        jobs.extract_hero_last_frame(Path(clip), frame)
+                        st.session_state[f"tf_{p.id}_hero_frame_path_{index}"] = str(frame)
+                    except Exception as exc:  # noqa: BLE001
+                        st.error(f"Could not extract last frame: {exc}")
+                frame_path = st.session_state.get(f"tf_{p.id}_hero_frame_path_{index}")
+                if frame_path and Path(frame_path).is_file():
+                    st.image(frame_path, caption="Final frame for continuity reference")
+                    with open(frame_path, "rb") as frame_file:
+                        st.download_button("Download final frame", frame_file, file_name=Path(frame_path).name,
+                                           mime="image/png", key=f"tf_{p.id}_hero_frame_dl_{index}")
+
+
 def page_storyboard() -> None:
     p = _project()
     plan = p.plan if p else None
@@ -1019,17 +1383,47 @@ def page_storyboard() -> None:
     c2.metric("Scenes", n)
     c3.metric("Est. runtime", _fmt_time(_est_runtime(p, plan)))
     c4.metric("Rendered", f"{done}/{n}")
+    _alignment_beats_panel(p)
+    _visual_bible_panel(p, running)
+    _channel_library_panel(p, running)
+    _style_reference_panel(p, running)
+    _hero_clips_panel(p, running)
+    bible = jobs.ensure_visual_bible(p)
+    visual_gate = bool(bible.get("required") and not bible.get("approved"))
+    if visual_gate:
+        st.info("Approve the Visual Bible above before generating or rendering scene images.")
+    engine_col, apply_col, choreo_col = st.columns([2, 1, 1])
+    bulk_engine = engine_col.selectbox(
+        "Bulk scene motion engine", list(VIDEO_SOURCES),
+        format_func=lambda key: VIDEO_SOURCES[key], key=f"tf_{p.id}_storyboard_bulk_engine",
+    )
+    if apply_col.button("Apply to all", disabled=running, width="stretch"):
+        for scene in plan.scenes:
+            scene.video_source = bulk_engine
+        p.set_plan(plan)
+        p.save()
+        _flash(f"Applied {VIDEO_SOURCES[bulk_engine]} to all scenes")
+        st.rerun()
+    if choreo_col.button("Auto-Choreograph", disabled=running or not plan.scenes, width="stretch",
+                         help="Assigns non-repeating camera presets to adjacent scenes."):
+        jobs.auto_choreograph(plan)
+        p.set_plan(plan)
+        p.save()
+        _flash("Camera presets assigned without adjacent repeats")
+        st.rerun()
     a1, a2, a3 = st.columns(3)
-    if a1.button("🖼️ Generate all missing visuals + voices", width="stretch", disabled=running):
+    if a1.button("🖼️ Generate all missing visuals + voices", width="stretch", disabled=running or visual_gate):
         jobs.MANAGER.start_render(p, assets_only=True)
         st.session_state[f"tf_was_running_{p.id}"] = True
         st.rerun()
-    if a2.button("🎬 Render all scenes + final film", type="primary", width="stretch", disabled=running):
+    if a2.button("🎬 Render all scenes + final film", type="primary", width="stretch",
+                 disabled=running or visual_gate):
         jobs.MANAGER.start_render(p)
         st.session_state[f"tf_was_running_{p.id}"] = True
         st.rerun()
     failed = [sc.id for sc in plan.scenes if p.state(sc.id).get("status") == "error"]
-    if a3.button(f"🔁 Retry failed scenes ({len(failed)})", width="stretch", disabled=running or not failed):
+    if a3.button(f"🔁 Retry failed scenes ({len(failed)})", width="stretch",
+                 disabled=running or not failed or visual_gate):
         jobs.MANAGER.start_render(p, failed, assemble=False)
         st.session_state[f"tf_was_running_{p.id}"] = True
         st.rerun()
@@ -1050,6 +1444,69 @@ def page_storyboard() -> None:
         st.rerun()
 
 
+def _autoclip_panel(p: jobs.Project, running: bool) -> None:
+    outputs = p.data.get("outputs") or {}
+    with st.expander("📱 AutoClip — standalone subject-aware Shorts", expanded=False):
+        alignment_path = outputs.get("alignment")
+        source = outputs.get("video")
+        if not source or not Path(source).is_file() or not alignment_path or not Path(alignment_path).is_file():
+            st.info("Render the film with word alignment first. AutoClip uses the saved word timestamps.")
+            return
+        try:
+            words = json.loads(Path(alignment_path).read_text(encoding="utf-8"))
+            candidates = alignment.score_viral_moments(words, float(outputs.get("duration") or 0), limit=5)
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Could not score Shorts moments: {exc}")
+            return
+        if not candidates:
+            st.warning("No eligible word-timed windows were found. Longer narration (at least about 30 seconds) is needed.")
+            return
+        labels = {
+            f"{item['score']}/100 · {_fmt_time(item['start'])}–{_fmt_time(item['end'])} · {item['title']}": index
+            for index, item in enumerate(candidates)
+        }
+        selected = st.multiselect("Choose 1–5 standalone moments", list(labels),
+                                  default=list(labels)[:min(2, len(labels))], key=f"tf_{p.id}_autoclip_choice")
+        st.caption("The heuristic virality score is a ranking aid, not a prediction of audience performance. Face detection "
+                   "tracks the largest face; visual saliency is used when no face is found.")
+        presets = ["Hormozi Bounce", "Clean Documentary", "Karaoke Glow", "Minimalist White", "Shorts Pop"]
+        current_preset = p.settings.get("caption_preset", presets[0])
+        preset = st.selectbox("Shorts caption preset", presets,
+                              index=presets.index(current_preset) if current_preset in presets else 0,
+                              key=f"tf_{p.id}_autoclip_caption")
+        if p.settings.get("caption_preset") != preset:
+            p.settings["caption_preset"] = preset
+            p.save()
+        if st.button("Render selected Shorts to project/shorts", disabled=running or not selected,
+                     key=f"tf_{p.id}_autoclip_render"):
+            directory = p.dir / "shorts"
+            directory.mkdir(parents=True, exist_ok=True)
+            saved = []
+            try:
+                accent = p.settings.get("brand_accent_color", "#22D3EE")
+                for selection in selected:
+                    item = candidates[labels[selection]]
+                    filename = re.sub(r"[^a-z0-9]+", "-", item["title"].lower()).strip("-")[:48] or "short"
+                    target = directory / f"{filename}_{int(item['start']):04d}.mp4"
+                    render.make_autoclip_short(Path(source), target, float(item["start"]), float(item["end"]),
+                                               words=words, accent=accent, caption_preset=preset)
+                    saved.append(str(target))
+                outputs["autoclips"] = list(dict.fromkeys((outputs.get("autoclips") or []) + saved))
+                p.data["outputs"] = outputs
+                p.data["autoclip_candidates"] = candidates
+                p.save()
+                _flash(f"Rendered {len(saved)} subject-reframed Short(s)")
+                st.rerun()
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"AutoClip render failed: {exc}")
+        for path in outputs.get("autoclips") or []:
+            if Path(path).is_file():
+                st.video(path)
+                with open(path, "rb") as short_file:
+                    st.download_button("Download Short", short_file, file_name=Path(path).name,
+                                       mime="video/mp4", key=f"tf_{p.id}_autoclip_dl_{Path(path).name}")
+
+
 def page_timeline() -> None:
     p = _project()
     plan = p.plan if p else None
@@ -1058,6 +1515,7 @@ def page_timeline() -> None:
         return
     running = _running(p)
     st.markdown("#### 🎞️ Timeline & Visual Pacing")
+    _alignment_beats_panel(p)
 
     est_total = _est_runtime(p, plan)
     try:
@@ -1080,6 +1538,24 @@ def page_timeline() -> None:
         p.data["visual_qa"] = qa
         p.save()
     _visual_qa_panel(p)
+    engine_col, apply_col, choreo_col = st.columns([2, 1, 1])
+    bulk_engine = engine_col.selectbox(
+        "Bulk videoSource", list(VIDEO_SOURCES),
+        format_func=lambda key: VIDEO_SOURCES[key], key=f"tf_{p.id}_timeline_bulk_engine",
+    )
+    if apply_col.button("Apply engine", disabled=running, width="stretch"):
+        for scene in plan.scenes:
+            scene.video_source = bulk_engine
+        p.set_plan(plan)
+        p.save()
+        _flash(f"Applied {VIDEO_SOURCES[bulk_engine]} to all scenes")
+        st.rerun()
+    if choreo_col.button("Auto-Choreograph", disabled=running or not plan.scenes, width="stretch"):
+        jobs.auto_choreograph(plan)
+        p.set_plan(plan)
+        p.save()
+        _flash("Camera presets assigned without adjacent repeats")
+        st.rerun()
 
     # Visual Multi-Segment Timeline Bar
     SEG_GRADIENTS = [
@@ -1132,7 +1608,10 @@ def page_timeline() -> None:
     import pandas as pd
     rows = []
     for i, sc in enumerate(plan.scenes):
-        rows.append({"#": i + 1, "Title": sc.title, "Source": sc.source, "Min sec": sc.duration,
+        video_source = sc.video_source if sc.video_source in VIDEO_SOURCES else "original_motion"
+        motion_preset = sc.motion_preset if sc.motion_preset in jobs.MOTION_PRESETS else "dolly_in"
+        rows.append({"#": i + 1, "Title": sc.title, "Source": sc.source, "Video engine": video_source,
+                     "Motion preset": motion_preset, "Min sec": sc.duration,
                      "Camera": sc.camera_move, "Shot": sc.shot_type, "Transition": sc.transition,
                      "Atmosphere": sc.atmosphere, "Music cue": sc.music_cue or "", "SFX": sc.sfx, "Ambience": sc.ambience,
                      "Status": p.state(sc.id).get("status", "pending")})
@@ -1140,6 +1619,8 @@ def page_timeline() -> None:
     cfg = {
         "#": st.column_config.NumberColumn(disabled=True, width="small"),
         "Source": st.column_config.SelectboxColumn(options=list(SOURCES)),
+        "Video engine": st.column_config.SelectboxColumn(options=list(VIDEO_SOURCES)),
+        "Motion preset": st.column_config.SelectboxColumn(options=list(jobs.MOTION_PRESETS)),
         "Min sec": st.column_config.NumberColumn(min_value=2.0, max_value=30.0, step=0.5),
         "Camera": st.column_config.SelectboxColumn(options=list(cinema.CAMERA_MOVES)),
         "Shot": st.column_config.SelectboxColumn(options=cinema.SHOT_TYPES),
@@ -1156,6 +1637,7 @@ def page_timeline() -> None:
         for i, row in edited.iterrows():
             sc = plan.scenes[i]
             sc.title, sc.source, sc.duration = str(row["Title"]), str(row["Source"]), float(row["Min sec"])
+            sc.video_source, sc.motion_preset = str(row["Video engine"]), str(row["Motion preset"])
             sc.camera_move, sc.shot_type, sc.transition = row["Camera"], row["Shot"], row["Transition"]
             sc.atmosphere, sc.music_cue, sc.sfx, sc.ambience = row["Atmosphere"], row["Music cue"] or "", row["SFX"], row["Ambience"]
         p.set_plan(plan)
@@ -1208,6 +1690,17 @@ def page_timeline() -> None:
     with d3:
         setting(p, "transition_override", "select", "Transitions", options=[""] + list(cinema.TRANSITIONS),
                 format_func=lambda t: t or "Per scene (AI)")
+    setting(p, "kinetic_captions", "toggle", "Burn in kinetic word-highlight captions",
+            help="Uses word-level transcription, 2–4 word context lines, and the channel accent color.")
+    if p.settings.get("kinetic_captions", False):
+        setting(p, "caption_preset", "select", "Viral caption preset",
+                options=["Hormozi Bounce", "Clean Documentary", "Karaoke Glow",
+                         "Minimalist White", "Shorts Pop"])
+        color = st.color_picker("Kinetic caption highlight color", p.settings.get("caption_color", "#22D3EE"),
+                                key=f"tf_{p.id}_caption_color")
+        if color != p.settings.get("caption_color"):
+            p.settings["caption_color"] = color
+            p.save()
 
 
 def page_audio() -> None:
@@ -1221,26 +1714,147 @@ def page_audio() -> None:
     c1, c2 = st.columns(2)
     with c1:
         setting(p, "language", "select", "Language", options=list(tts.EDGE_VOICES))
-        st.caption("Free-tier mode uses Microsoft Edge neural voices; paid speech APIs are not called.")
-        eng = "edge"
-        opts = tts.voice_options(s["language"])
+        if s["language"] == "English":
+            engine_options = ["kokoro", "groq_orpheus", "sarvam", "edge"]
+        elif s["language"] == "Hindi":
+            engine_options = ["sarvam", "edge"]
+        else:
+            engine_options = ["edge"]
+        engine_key = f"tf_{p.id}_voice_engine"
+        engine = s.get("voice_engine", "kokoro")
+        if engine not in engine_options:
+            engine = engine_options[0]
+            st.session_state[engine_key] = engine
+        eng = st.selectbox(
+            "Production voice engine",
+            engine_options,
+            index=engine_options.index(engine),
+            format_func=lambda key: tts.TTS_ENGINES[key],
+            key=engine_key,
+            disabled=running,
+        )
+        if eng != s.get("voice_engine"):
+            p.settings["voice_engine"] = eng
+            p.save()
+        st.caption("Kokoro runs offline and is the default English production voice. Edge is labeled as a fast draft preview.")
+        opts = tts.voice_options(s["language"], eng)
         labels = dict(opts)
-        setting(p, "voice", "select", "Voice", options=[v for v, _ in opts], format_func=lambda v: labels.get(v, v))
+        if opts:
+            voice_ids = [v for v, _ in opts]
+            voice = s.get("voice") if s.get("voice") in voice_ids else voice_ids[0]
+            selected_voice = st.selectbox(
+                "Voice",
+                voice_ids,
+                index=voice_ids.index(voice),
+                format_func=lambda v: labels.get(v, v),
+                key=f"tf_{p.id}_voice_{eng}",
+                disabled=running,
+            )
+            if selected_voice != s.get("voice"):
+                p.settings["voice"] = selected_voice
+                p.save()
+        else:
+            st.warning("No production voices are available for this language. Select Edge TTS (Fast Draft Preview).")
     with c2:
         setting(p, "voice_speed", "slider", "Speed", min_value=0.7, max_value=1.4, step=0.05)
-        setting(p, "voice_pitch", "slider", "Pitch (Hz)", min_value=-30, max_value=30, step=1)
+        if eng == "edge":
+            setting(p, "voice_pitch", "slider", "Pitch (Hz)", min_value=-30, max_value=30, step=1)
         setting(p, "dialogue_voices", "toggle", "Distinct voices for character dialogue")
         if st.button("▶ Preview narrator", disabled=running):
             with st.spinner("Synthesising…"):
                 try:
-                    st.session_state["tf_prev_narrator"] = tts.sample(s["voice"], s["language"], eng, s["voice_speed"])
+                    st.session_state["tf_prev_narrator"] = tts.sample(
+                        s.get("voice", "af_bella"), s["language"], eng, s["voice_speed"]
+                    )
                 except Exception as e:  # noqa: BLE001
                     st.session_state.pop("tf_prev_narrator", None)
                     st.error(f"Voice preview failed: {e}")
         if st.session_state.get("tf_prev_narrator"):
             st.audio(st.session_state["tf_prev_narrator"], format="audio/mp3")
-    st.markdown("#### 🎼 Soundtrack")
+        if st.button("▶ Fast draft preview (Edge TTS)", disabled=running):
+            try:
+                draft_voice = tts.voice_options(s["language"], "edge")[0][0]
+                st.session_state["tf_prev_draft"] = tts.sample(
+                    draft_voice, s["language"], "edge", s["voice_speed"]
+                )
+            except Exception as e:  # noqa: BLE001
+                st.session_state.pop("tf_prev_draft", None)
+                st.error(f"Draft preview failed: {e}")
+        if st.session_state.get("tf_prev_draft"):
+            st.audio(st.session_state["tf_prev_draft"], format="audio/mp3")
+        if eng == "sarvam":
+            st.caption("Sarvam uses the SARVAM_API_KEY server environment variable and supports Hindi/Indian English code-switching.")
+            if not config.sarvam_key():
+                st.warning("SARVAM_API_KEY is not configured in the server environment.")
+        if eng == "groq_orpheus" and not config.groq_key():
+            st.warning("GROQ_API_KEY is not configured; Groq Orpheus cannot be used until it is set.")
+    st.markdown("#### 🎙️ Import External Voiceover (WAV/MP3)")
+    voiceover_upload = st.file_uploader(
+        "Import External Voiceover (WAV/MP3)",
+        type=["wav", "mp3"],
+        key=f"tf_{p.id}_voiceover_upload",
+        help="Uses your imported narration in the final mix instead of synthesizing scene voices.",
+    )
+    if voiceover_upload is not None and st.button("Use imported voiceover", disabled=running):
+        try:
+            p.settings["external_voiceover_path"] = _save_upload(
+                p, voiceover_upload, "audio", "external_voiceover"
+            )
+            p.save()
+            try:
+                aligned = alignment.align_project_audio(
+                    Path(p.settings["external_voiceover_path"]), p.dir,
+                    language={"English": "en", "Hindi": "hi"}.get(s.get("language", "English")),
+                    log=p.log, force=True, model_size=str(s.get("alignment_model", "tiny")),
+                )
+                _flash(f"Word alignment saved ({len(aligned)} words)")
+            except Exception as align_error:
+                _flash(f"Voiceover imported, but alignment failed: {align_error}", "error")
+            st.rerun()
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Could not import voiceover: {exc}")
+    setting(p, "alignment_model", "select", "Local Whisper fallback model",
+            options=["tiny", "base", "small"],
+            help="Runs on CPU with int8 quantization; larger models improve accuracy but take more time and memory.")
+    external_path = s.get("external_voiceover_path", "")
+    if external_path:
+        st.caption("Imported narration replaces generated voices. Extend the project timeline if needed; longer audio is not silently truncated.")
+        if Path(external_path).exists():
+            st.caption(f"Imported narration: {Path(external_path).name}")
+            st.audio(external_path)
+            if st.button("Rebuild word alignment", disabled=running):
+                try:
+                    aligned = alignment.align_project_audio(
+                        Path(external_path), p.dir,
+                        language={"English": "en", "Hindi": "hi"}.get(s.get("language", "English")),
+                        log=p.log, force=True, model_size=str(s.get("alignment_model", "tiny")),
+                    )
+                    st.success(f"Saved word timestamps for {len(aligned)} words.")
+                except Exception as exc:
+                    st.error(f"Could not align imported voiceover: {exc}")
+        else:
+            st.error(f"Imported voiceover file is missing: {external_path}")
+        if st.button("Remove imported voiceover", disabled=running):
+            p.settings["external_voiceover_path"] = ""
+            p.save()
+            st.rerun()
     plan = p.plan
+    script = "\n\n".join(
+        line
+        for scene in (plan.scenes if plan else [])
+        for line in ([scene.narration.strip()] + [dialogue.line.strip() for dialogue in scene.dialogue])
+        if line
+    )
+    if script:
+        words = script.split()
+        script_blocks = "\n\n".join(
+            f"Chunk {index + 1}\n" + " ".join(words[start:start + 200])
+            for index, start in enumerate(range(0, len(words), 200))
+        )
+        with st.expander("📋 Copy Chunked Script (200-word blocks)"):
+            st.caption("Use the code block's copy button, then generate each block in your free external voice tool.")
+            st.code(script_blocks, language=None, height=260)
+    st.markdown("#### 🎼 Soundtrack")
     m1, m2 = st.columns(2)
     with m1:
         setting(p, "music_mood", "select", "Music mood", options=["auto"] + cinema.MUSIC_MOODS,
@@ -1273,6 +1887,7 @@ def page_audio() -> None:
         setting(p, "music_vol", "slider", "Music volume", min_value=0.0, max_value=1.0, step=0.05)
         setting(p, "fx_vol", "slider", "Ambience & SFX volume", min_value=0.0, max_value=1.0, step=0.05)
         setting(p, "duck", "slider", "Duck music under voice", min_value=0.0, max_value=1.0, step=0.05)
+        setting(p, "duck_db", "slider", "Music below narration (dB)", min_value=-26.0, max_value=-22.0, step=0.5)
         setting(p, "loudness", "slider", "Loudness target (LUFS)", min_value=-23.0, max_value=-9.0, step=0.5)
         setting(p, "ambience_on", "toggle", "Scene ambience (rain, city, wind…)")
         setting(p, "sfx_on", "toggle", "Scene sound effects (whoosh, impact…)")
@@ -1300,6 +1915,14 @@ def page_render() -> None:
     s = p.settings
     out = p.data.get("outputs") or {}
     _visual_qa_panel(p)
+    audit = jobs.monetization_audit(p)
+    with st.expander("✅ Pre-render Monetization & Quality Audit", expanded=not audit["passed"]):
+        st.caption("Non-blocking readiness checks. AI disclosure helper: " + audit["ai_disclosure"])
+        st.dataframe([{"Check": row["name"], "Status": "✅ ready" if row["passed"] else "⚠ review",
+                       "Details": row["detail"]} for row in audit["checks"]],
+                     hide_index=True, width="stretch")
+        st.caption("Audio measurements are configuration targets here; verify the final file with loudness analysis "
+                   "before publishing.")
     if out.get("video") and Path(out["video"]).exists():
         st.markdown(f"### 🎉 {_esc(plan.title if plan else 'Your film')}")
         v1, v2 = st.columns([3, 1])
@@ -1326,16 +1949,28 @@ def page_render() -> None:
                     with open(tpath, "rb") as fh:
                         tc[ti].download_button("⬇️", fh, file_name=Path(tpath).name, mime="image/jpeg",
                                                key=f"tf_dl_thumb_{ti}", width="stretch")
-        d = st.columns(5)
+        png_thumbnails = [path for path in out.get("thumbnails_png", []) if Path(path).is_file()]
+        if png_thumbnails:
+            with st.expander(f"🧩 A/B hook thumbnails (PNG · {len(png_thumbnails)} variants)", expanded=False):
+                thumb_cols = st.columns(len(png_thumbnails))
+                for index, path in enumerate(png_thumbnails):
+                    thumb_cols[index].image(path)
+                    with open(path, "rb") as png_file:
+                        thumb_cols[index].download_button(
+                            "Download PNG", png_file, file_name=Path(path).name, mime="image/png",
+                            key=f"tf_dl_thumb_png_{index}",
+                        )
+        d = st.columns(6)
         for col, key, lab, mime in ((d[0], "video", "⬇️ Video", "video/mp4"), (d[1], "srt", "⬇️ Subtitles (SRT)", "text/plain"),
-                                    (d[2], "thumbnail", "⬇️ Thumbnail", "image/jpeg"),
-                                    (d[3], "metadata", "⬇️ YouTube metadata", "text/plain")):
+                                    (d[2], "vtt", "⬇️ Subtitles (VTT)", "text/vtt"),
+                                    (d[3], "thumbnail", "⬇️ Thumbnail", "image/jpeg"),
+                                    (d[4], "metadata", "⬇️ YouTube metadata", "text/plain")):
             f = out.get(key)
             if f and Path(f).exists():
                 with open(f, "rb") as fh:
                     col.download_button(lab, fh, file_name=Path(f).name, mime=mime, width="stretch",
                                         key=f"tf_dl_{key}")
-        if d[4].button("📦 Build project package", width="stretch", disabled=running):
+        if d[5].button("📦 Build project package", width="stretch", disabled=running):
             with st.spinner("Zipping film, subtitles, plan and every scene asset…"):
                 st.session_state[f"tf_zip_{p.id}"] = str(jobs.package_zip(p))
         zp = st.session_state.get(f"tf_zip_{p.id}")
@@ -1357,7 +1992,29 @@ def page_render() -> None:
                 if plan and plan.tags:
                     st.markdown("**YouTube Tags:**")
                     st.code(", ".join(plan.tags), language=None)
+                if out.get("pinned_comment"):
+                    st.markdown("**Pinned Comment:**")
+                    st.code(out["pinned_comment"], language=None)
+        if out.get("video") and Path(out["video"]).is_file():
+            if st.button("Upload as PRIVATE YouTube draft", disabled=running,
+                         key=f"tf_{p.id}_youtube_upload"):
+                client = Path(config.youtube_client_secret_path())
+                token = config.CACHE_DIR / "youtube" / "token.json"
+                try:
+                    video_id = youtube_upload.upload_private_draft(
+                        Path(out["video"]), client, token,
+                        title=(plan.youtube_title or plan.title) if plan else "TubeForge video",
+                        description=out.get("description", ""),
+                        tags=plan.tags if plan else [],
+                        thumbnail=Path(out["thumbnail"]) if out.get("thumbnail") else None,
+                        captions_srt=Path(out["srt"]) if out.get("srt") else None,
+                        caption_language={"Hindi": "hi", "English": "en"}.get(s.get("language", "English"), "en"),
+                    )
+                    st.success(f"Uploaded as private draft: https://www.youtube.com/watch?v={video_id}")
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Private YouTube upload failed: {exc}")
         st.divider()
+    _autoclip_panel(p, running)
     st.markdown("#### 📐 Export settings")
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -1401,6 +2058,10 @@ def page_render() -> None:
     e1, e2 = st.columns(2)
     with e1:
         engines = ["auto"] + images.AUTO_ORDER
+        if images.engine_available("cf_klein4b")[0]:
+            engines.append("cf_klein4b")
+        if config.pollinations_key():
+            engines.append("pollinations_key")
 
         def elabel(k):
             if k == "auto":
@@ -1409,12 +2070,53 @@ def page_render() -> None:
             e = images.ENGINES[k]
             return f"{e.label} · {e.tier}" + ("" if ok else " · unavailable")
         setting(p, "image_engine", "select", "Image engine", options=engines, format_func=elabel)
-        setting(p, "allow_stock", "toggle", "Allow Pixabay stock photos as last-resort fallback")
+        if s.get("image_engine") == "cf_klein4b":
+            st.warning("FLUX.2 Klein is explicit opt-in for bulk scenes (~1,364 estimated neurons per 1 MP image); "
+                       "daily neuron usage is locally budget-guarded.")
+        if config.pollinations_key():
+            st.caption("Authenticated Pollinations is available as an explicit engine; API-key usage may consume account balance. "
+                       "It is not used automatically.")
+        setting(p, "allow_stock", "toggle", "Allow stock photos as last-resort fallback (Pexels / Pixabay)")
         setting(p, "negative_global", "text", "Global negative prompt")
     with e2:
         st.markdown("**🎥 Free original motion**")
         st.caption("Each scene gets an original generated frame, then local camera movement, simulated parallax and "
-                   "atmosphere. Pixabay footage is optional. Hosted AI video models are disabled to prevent charges.")
+                   "atmosphere. Pexels and Pixabay footage are optional. Hosted AI video models are disabled to prevent charges.")
+    st.markdown("#### 🎞️ Local scene motion engines")
+    st.caption("Procedural graphics run as isolated Remotion scenes, then join the existing Timeline assembly and receive "
+               "the usual captions, transitions, audio and export treatment.")
+    st.markdown("**Procedural motion-graphic brand palette**")
+    brand_cols = st.columns(3)
+    brand_values = [
+        brand_cols[0].color_picker("Primary", s.get("brand_primary_color", "#8B5CF6"),
+                                   key=f"tf_{p.id}_proc_brand_primary"),
+        brand_cols[1].color_picker("Secondary", s.get("brand_secondary_color", "#22D3EE"),
+                                   key=f"tf_{p.id}_proc_brand_secondary"),
+        brand_cols[2].color_picker("Accent", s.get("brand_accent_color", "#F472B6"),
+                                   key=f"tf_{p.id}_proc_brand_accent"),
+    ]
+    brand_keys = ("brand_primary_color", "brand_secondary_color", "brand_accent_color")
+    if any(s.get(key) != value for key, value in zip(brand_keys, brand_values)):
+        for key, value in zip(brand_keys, brand_values):
+            s[key] = value
+        p.save()
+    st.caption("These project colors and the Channel Name are passed dynamically to every procedural template.")
+    engine_col, apply_col = st.columns([3, 1])
+    with engine_col:
+        default_video_source = setting(
+            p, "default_video_source", "select", "Default videoSource for new scenes",
+            options=list(VIDEO_SOURCES), format_func=lambda key: VIDEO_SOURCES[key],
+        )
+    with apply_col:
+        if st.button("Apply to all scenes", disabled=running or not plan, width="stretch"):
+            for scene in plan.scenes:
+                scene.video_source = default_video_source
+            p.set_plan(plan)
+            p.save()
+            _flash(f"Applied {VIDEO_SOURCES[default_video_source]} to all scenes")
+            st.rerun()
+    st.caption("DepthFlow, cutout and Remotion dependencies are optional. If a selected engine is unavailable, the built-in "
+               "FFmpeg motion renderer is used and the warning is recorded in Providers.")
     st.markdown("#### 🚀 Produce")
     if not plan:
         st.info("Generate a plan first (✨ Create).")
@@ -1447,29 +2149,81 @@ def page_render() -> None:
 
 def page_providers() -> None:
     conf = config.configured_providers()
-    conf["pollinations (keyed)"] = bool(config.pollinations_key())
     breakers = http.breaker_status()
     usage = cache.usage_today()
     st.markdown("#### 🔌 Providers")
     rows = []
-    roles = {"groq": "Free-tier LLM (scene breakdowns)", "openrouter": "Creative LLM (free models only)",
-             "cloudflare": "FLUX.2 Klein 4B images (10k free neurons/day)",
-             "pixabay": "Free stock video & photos", "gemini": "Disabled in free-only mode",
-             "pollinations (keyed)": "Disabled in free-only mode"}
+    roles = {"groq": "Groq LLM + Orpheus TTS (TTS app cap: 10 RPM / 100 requests per UTC day)",
+             "sarvam": "Optional Hindi / Hinglish Bulbul v4 Flash TTS",
+             "openrouter": "Free :free LLM models with rate-limit rotation",
+             "cloudflare": "FLUX.1 Schnell bulk stills; FLUX.2 Klein reserved for Visual Bible / opt-in images",
+             "pixabay": "Free stock video & photos", "pexels": "Stock video & photos (200 req/hr, 20k/month)",
+             "gemini": "Gemini 3.5 Flash-Lite (local cap 500/day) + 3.8 Flash (20/day)",
+             "pollinations": "Authenticated image endpoint; explicit API-key use may consume account balance"}
     for k, ok in conf.items():
         blocked = [f"{b}: {r[:90]}" for b, r in breakers.items() if b.split(":")[0].startswith(k.split(" ")[0])]
         rows.append({"Provider": k, "Key": "✅ configured" if ok else "— missing", "Role": roles.get(k, ""),
                      "Status": ("⏸ " + " | ".join(blocked)) if blocked else ("ready" if ok else "")})
     st.dataframe(rows, hide_index=True, width="stretch")
-    st.caption("Keys are read from `.env` / environment on the server and never sent to the browser. Only free-tier "
-               "models and providers are used; quota limits are not bypassed.")
+    st.caption("Keys are read from `.env` / environment on the server and never sent to the browser. Free-provider "
+               "limits are tracked locally; rate limits are not bypassed.")
+    st.caption("Groq's current model catalog lists per-token prices. Groq calls may be metered depending on your account plan; "
+               "the local TTS request cap is not a billing guarantee.")
+    st.markdown("[Photos and videos provided by Pexels](https://www.pexels.com)")
     c1, c2, c3 = st.columns(3)
-    c1.metric("Cloudflare neurons today (est.)", f"{usage.get('cloudflare_neurons', 0):.0f}",
+    c1.metric("Estimated Neurons (local calculation; resets 00:00 UTC)",
+              f"{usage.get('cloudflare_neurons', 0):.0f}",
               f"of {cache.CLOUDFLARE_FREE_NEURONS} free", delta_color="off")
     c2.metric("OpenRouter spend today", f"${usage.get('openrouter_usd', 0):.2f}")
     c3.metric("API calls today", sum((usage.get("calls") or {}).values()))
+    st.caption(f"Groq Orpheus TTS requests today: {usage.get('calls', {}).get('groq_tts', 0)} / 100. "
+               "The local request limiter allows at most 10 per minute.")
+    gemini_calls = usage.get("calls", {})
+    st.caption("Gemini local daily caps: "
+               f"Flash-Lite {gemini_calls.get('gemini:gemini-3.5-flash-lite', 0)} / 500; "
+               f"Flash creative {gemini_calls.get('gemini:gemini-3.8-flash', 0)} / 20.")
+    pexels_quota = cache.provider_quota("pexels")
+    remote_remaining = pexels_quota.get("remote_month_remaining")
+    pexels_month = (f"{remote_remaining} requests remain this month (provider-reported)" if remote_remaining is not None
+                    else f"{pexels_quota['monthly_used']} locally tracked requests this month")
+    st.caption(f"Pexels: {pexels_quota['hourly_used']} / 200 requests in the rolling hour; {pexels_month}. "
+               f"Today: {gemini_calls.get('pexels', 0)} requests.")
     if usage.get("calls"):
         st.caption(" · ".join(f"{k}: {v}" for k, v in sorted(usage["calls"].items())))
+    if config.pollinations_key_kind() == "publishable":
+        st.warning("POLLINATIONS_API_KEY has a pk_ publishable prefix. Image requests require a secret sk_ key and will return HTTP 401.")
+    if config.pollinations_key_kind() == "unknown" and config.pollinations_key():
+        st.warning("Pollinations key prefix is not recognized. Authenticated image requests require an sk_ secret key.")
+    comfy_url = config.comfyui_url()
+    workflow_path = config.comfyui_workflow_path()
+    st.markdown("#### 🧩 Optional local ComfyUI")
+    st.caption(f"Configured endpoint: {comfy_url or 'invalid URL'} · workflow: "
+               f"{workflow_path or 'not configured'}. When ComfyUI is not used or unavailable, use the built-in "
+               "DepthFlow CPU/GPU and FFmpeg motion fallback chain.")
+    if st.button("Check ComfyUI connection", key="tf_comfy_check"):
+        try:
+            response = http.request("comfyui", "GET", f"{comfy_url}/system_stats", timeout=4, retries=0)
+            st.success(f"ComfyUI responded (HTTP {response.status_code}).")
+        except Exception as exc:  # noqa: BLE001
+            st.warning(f"ComfyUI unavailable; local DepthFlow / FFmpeg remains available: {exc}")
+    st.markdown("#### 🎞️ Local motion engines")
+    motion_status = render.motion_engine_status()
+    engine_labels = {
+        "depthflow_3d": "DepthFlow 3D",
+        "cutout_2d": "2D layered cutout",
+        "procedural_3d_2d": "Remotion procedural 3D/2D",
+    }
+    st.dataframe([
+        {"Engine": engine_labels[key], "Dependencies installed": value["installed"],
+         "Last result": value["state"]}
+        for key, value in motion_status.items()
+    ], hide_index=True, width="stretch")
+    for key, value in motion_status.items():
+        if value.get("warning"):
+            st.warning(f"{engine_labels[key]} fallback: {value['warning']}")
+    st.caption("Optional installs: `pip install -r requirements-visual-engines.txt` for DepthFlow/cutout; install Node.js "
+               "20+ and run `npm install` in `remotion-engine` for procedural graphics. DepthFlow is distributed under "
+               "AGPL-3.0; review its license before enabling it in a redistributed deployment.")
     st.markdown("#### 🧪 Connection tests")
     t1, t2, t3 = st.columns(3)
     if t1.button("Test LLM router", width="stretch"):
@@ -1490,6 +2244,77 @@ def page_providers() -> None:
             http._breaker.clear()
         _flash("Providers will be retried on the next request")
         st.rerun()
+    st.markdown("#### 🧪 Minimal-quota live provider verification")
+    st.caption("Runs one small real request for each configured provider. Requests may consume the provider's quota; "
+               "unset providers are reported as SKIPPED. Raw keys are never printed.")
+    if st.button("Run Live Key Check (Minimal Quota)", key="tf_live_provider_check"):
+        script = Path(__file__).resolve().parents[1] / "scripts" / "test_live_providers.py"
+        with st.spinner("Running minimal live checks; this may take a few minutes…"):
+            try:
+                proc = subprocess.run([sys.executable, str(script), "--json"], capture_output=True,
+                                      text=True, timeout=600, check=False)
+                report = json.loads(proc.stdout)
+                st.dataframe(report.get("results", []), hide_index=True, width="stretch")
+                st.json(report.get("summary", {}))
+                if proc.stderr.strip():
+                    st.caption(proc.stderr[-1200:])
+            except subprocess.TimeoutExpired:
+                st.error("Live provider checks timed out. No secret values were collected.")
+            except (json.JSONDecodeError, OSError) as exc:
+                st.error(f"Could not read live provider results: {exc}")
+    st.markdown("#### 🔐 YouTube OAuth (private drafts only)")
+    client_path = Path(config.youtube_client_secret_path())
+    client_upload = st.file_uploader("Add OAuth client_secret.json", type=["json"], key="tf_youtube_client_secret")
+    if client_upload is not None and st.button("Save OAuth client file", key="tf_save_youtube_client"):
+        try:
+            payload = json.loads(client_upload.getvalue().decode("utf-8"))
+            if not isinstance(payload, dict) or not any(key in payload for key in ("installed", "web")):
+                raise ValueError("This does not look like a Google OAuth desktop/web client file.")
+            client_path.parent.mkdir(parents=True, exist_ok=True)
+            client_path.write_text(json.dumps(payload), encoding="utf-8")
+            st.success(f"OAuth client stored locally at {client_path}.")
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Could not save OAuth client file: {exc}")
+    if client_path.is_file():
+        st.caption("OAuth client file is present on this machine; authorization is local and never uploaded to TubeForge.")
+        if st.button("Connect / verify YouTube channel (read-only)", key="tf_youtube_connect"):
+            try:
+                channel = youtube_upload.channel_title(client_path, config.CACHE_DIR / "youtube" / "readonly_token.json",
+                                                      allow_browser=True)
+                st.success(f"Connected channel: {channel}")
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"YouTube connection failed: {exc}")
+        if st.button("Authorize private draft uploads", key="tf_youtube_upload_auth"):
+            try:
+                youtube_upload.connect(client_path, config.CACHE_DIR / "youtube" / "token.json",
+                                       allow_browser=True)
+                st.success("Private draft upload permissions were authorized and saved locally.")
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"YouTube upload authorization failed: {exc}")
+    st.markdown("#### 🖥️ Local engines")
+    if st.button("Check Local Engines", width="stretch"):
+        script = Path(__file__).resolve().parents[1] / "scripts" / "check_media_env.py"
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(script)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if proc.stdout.strip():
+                report = json.loads(proc.stdout)
+                st.json(report)
+                if proc.returncode != 0:
+                    st.warning("One or more required local engines are missing or below the supported version.")
+            else:
+                st.error(proc.stderr.strip() or "Local engine check returned no result.")
+        except subprocess.TimeoutExpired:
+            st.error("Local engine check timed out.")
+        except json.JSONDecodeError:
+            st.error(proc.stdout.strip() or proc.stderr.strip() or "Local engine check returned invalid output.")
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Could not run the local engine check: {exc}")
     st.markdown("#### Available image engines")
     st.dataframe([{"Engine": e.label, "Tier": e.tier, "Refs": "✅" if e.refs else "", "Ready": "✅" if images.engine_available(k)[0]
                    else "— " + images.engine_available(k)[1][:80], "Note": e.note} for k, e in images.ENGINES.items()
@@ -1520,7 +2345,7 @@ def render_studio(public_mode: bool = False) -> None:
                 st.caption("⚙️ Running: " + ", ".join(b[:24] for b in busy))
         if st.button("↻ Refresh projects and page", width="stretch"):
             st.rerun()
-        st.caption("Generation is restricted to free-tier providers/models and local tools. Free provider quotas and availability apply.")
+        st.caption("Generation uses configured providers and local tools. Groq and explicit authenticated Pollinations usage may be metered by your account.")
     st.markdown("<div class='tf-hero'><h1>TubeForge Cinematic AI Studio</h1><p>Idea → story → characters → scenes → "
                 "visuals → voice → music → edit → render → export. Hollywood-style camera moves, colour grading, "
                 "atmosphere, sound design and subtitles.</p></div>", unsafe_allow_html=True)

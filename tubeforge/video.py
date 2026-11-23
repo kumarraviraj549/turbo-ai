@@ -1,5 +1,4 @@
-"""Video sources: OpenRouter AI video generation (async submit/poll/download, paid credits) and Pixabay
-stock footage (free). Both return real video files; nothing is simulated."""
+"""Video sources: OpenRouter AI video generation and Pixabay/Pexels stock footage."""
 import base64
 import io
 import re
@@ -237,7 +236,7 @@ def generate_ai_clip(
 
 @dataclass
 class StockClip:
-    id: int
+    id: str
     url: str
     width: int
     height: int
@@ -245,44 +244,94 @@ class StockClip:
     thumb: str
     user: str
     page: str
+    provider: str = "Pixabay"
 
 
 def search_stock_videos(query: str, portrait: bool = False, min_width: int = 1280, per_page: int = 12) -> List[StockClip]:
-    if not config.pixabay_key():
-        return []
     q = re.sub(r"\s+", " ", query).strip()[:100]
-    params = {"key": config.pixabay_key(), "q": q, "video_type": "film", "safesearch": "true", "per_page": per_page,
-              "order": "popular"}
-    ck = cache.cache_key("pixabay_vid", q, per_page)
-    hits = cache.get_json("pixabay", ck, max_age=24 * 3600)
-    if hits is None:
-        resp = request("pixabay", "GET", "https://pixabay.com/api/videos/", params=params, timeout=30, retries=2)
-        hits = resp.json().get("hits") or []
-        cache.put_json("pixabay", ck, hits)
     clips = []
-    for h in hits:
-        vids = h.get("videos") or {}
-        renditions = [v for v in vids.values() if isinstance(v, dict) and v.get("url") and v.get("width")]
-        if not renditions:
-            continue
-        # Smallest rendition that still meets the target width, else the largest available.
-        big_enough = [v for v in renditions if v["width"] >= min_width]
-        best = min(big_enough, key=lambda v: v["width"]) if big_enough else max(renditions, key=lambda v: v["width"])
-        clips.append(StockClip(h.get("id"), best["url"], best.get("width", 0), best.get("height", 0),
-                               float(h.get("duration") or 0), best.get("thumbnail") or "", h.get("user", ""),
-                               h.get("pageURL", "")))
+    errors = []
+    if config.pexels_key():
+        params = {"query": q, "orientation": "portrait" if portrait else "landscape",
+                  "size": "medium", "per_page": min(80, max(1, per_page))}
+        ck = cache.cache_key("pexels_vid", q, params["orientation"], min_width, params["per_page"])
+        hits = cache.get_json("pexels", ck, max_age=24 * 3600)
+        if hits is None:
+            if not cache.reserve_provider_request("pexels", 200, 20000):
+                errors.append("Pexels local safety limit reached (200 requests/hour or 20,000/month)")
+            else:
+                try:
+                    resp = request("pexels", "GET", "https://api.pexels.com/v1/videos/search", params=params,
+                                   headers={"Authorization": config.pexels_key()}, timeout=30, retries=2)
+                    cache.record_usage("pexels")
+                    limit, remaining, reset = (resp.headers.get(name) for name in (
+                        "X-Ratelimit-Limit", "X-Ratelimit-Remaining", "X-Ratelimit-Reset"))
+                    if limit and remaining and reset:
+                        cache.record_provider_quota("pexels", int(limit), int(remaining), int(reset))
+                    hits = resp.json().get("videos") or []
+                    cache.put_json("pexels", ck, hits)
+                except ProviderError as exc:
+                    errors.append(str(exc)[:160])
+        if hits:
+            for hit in hits:
+                renditions = [item for item in hit.get("video_files", [])
+                              if item.get("link") and item.get("file_type") == "video/mp4"
+                              and item.get("width") and item.get("height")]
+                if not renditions:
+                    continue
+                big_enough = [item for item in renditions if item["width"] >= min_width]
+                best = min(big_enough, key=lambda item: item["width"]) if big_enough else max(
+                    renditions, key=lambda item: item["width"])
+                if (best["height"] > best["width"]) != portrait:
+                    continue
+                user = (hit.get("user") or {}).get("name", "unknown")
+                clips.append(StockClip(
+                    f"pexels-{hit.get('id')}", best["link"], best["width"], best["height"],
+                    float(hit.get("duration") or 0), hit.get("image", ""), user, hit.get("url", ""), "Pexels"))
+
+    if config.pixabay_key():
+        params = {"key": config.pixabay_key(), "q": q, "video_type": "film", "safesearch": "true",
+                  "per_page": per_page, "order": "popular"}
+        ck = cache.cache_key("pixabay_vid", q, portrait, per_page)
+        hits = cache.get_json("pixabay", ck, max_age=24 * 3600)
+        if hits is None:
+            try:
+                resp = request("pixabay", "GET", "https://pixabay.com/api/videos/", params=params,
+                               timeout=30, retries=2)
+                cache.record_usage("pixabay")
+                hits = resp.json().get("hits") or []
+                cache.put_json("pixabay", ck, hits)
+            except ProviderError as exc:
+                errors.append(str(exc)[:160])
+        if hits:
+            for hit in hits:
+                renditions = [item for item in (hit.get("videos") or {}).values()
+                              if isinstance(item, dict) and item.get("url") and item.get("width") and item.get("height")]
+                renditions = [item for item in renditions if (item["height"] > item["width"]) == portrait]
+                if not renditions:
+                    continue
+                # Smallest rendition that still meets target width, else the largest available.
+                big_enough = [item for item in renditions if item["width"] >= min_width]
+                best = min(big_enough, key=lambda item: item["width"]) if big_enough else max(
+                    renditions, key=lambda item: item["width"])
+                clips.append(StockClip(
+                    str(hit.get("id")), best["url"], best["width"], best["height"],
+                    float(hit.get("duration") or 0), best.get("thumbnail") or "", hit.get("user", ""),
+                    hit.get("pageURL", ""), "Pixabay"))
+    if not clips and errors:
+        raise VideoGenError("Stock search failed: " + " | ".join(errors[-2:]))
     return clips
 
 
 def download_stock_clip(clip: StockClip, out_path: Path) -> Path:
-    ck = cache.cache_key("pixabay_clip", clip.id, clip.url)
+    provider_key = clip.provider.lower()
+    ck = cache.cache_key(provider_key + "_clip", clip.id, clip.url)
     data = cache.get_bytes("video", ck, ".mp4")
     if not data:
-        data = request("pixabay_cdn", "GET", clip.url, timeout=180, retries=3).content
+        data = request(f"{provider_key}_cdn", "GET", clip.url, timeout=180, retries=3).content
         if len(data) < 10000:
-            raise VideoGenError("Pixabay returned an empty clip")
+            raise VideoGenError(f"{clip.provider} returned an empty clip")
         cache.put_bytes("video", ck, ".mp4", data)
-        cache.record_usage("pixabay")
     out_path.write_bytes(data)
     return out_path
 

@@ -1,0 +1,5 @@
+# Optional local video engines; these are not required for the built-in FFmpeg renderer.
+# DepthFlow currently declares AGPL-3.0 and pulls in PyTorch/Transformers for Depth Anything V2.
+depthflow>=1.0.1
+rembg[cpu]>=2.0
+opencv-python-headless>=4.10

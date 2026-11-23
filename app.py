@@ -1504,6 +1504,12 @@ POS_OPTIONS = ["Top-Right", "Top-Left", "Bottom-Right", "Bottom-Left"]
 PUBLIC_MODE = os.getenv("TUBEFORGE_PUBLIC_MODE", "").strip().lower() in ("1", "true", "yes", "on")
 APP_PASSWORD = os.getenv("APP_PASSWORD", "")
 
+from tubeforge import config
+
+if config.network_binding_requires_password(PUBLIC_MODE, st.get_option("server.address")) and not APP_PASSWORD:
+    st.error("This app is configured for network access. Set `APP_PASSWORD` before starting it to protect API keys.")
+    st.stop()
+
 if APP_PASSWORD and not st.session_state.get("authenticated"):
     st.markdown("## 🔒 TubeForge Studio Pro")
     with st.form("login"):

@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import urllib.parse
 from pathlib import Path
 
 ENV_FILE = Path(".env")
@@ -50,6 +51,10 @@ def groq_key() -> str:
     return secret("GROQ_API_KEY")
 
 
+def sarvam_key() -> str:
+    return secret("SARVAM_API_KEY")
+
+
 def openrouter_key() -> str:
     return secret("OPENROUTER_API_KEY")
 
@@ -58,12 +63,49 @@ def pixabay_key() -> str:
     return secret("PIXABAY_API_KEY")
 
 
+def pexels_key() -> str:
+    return secret("PEXELS_API_KEY")
+
+
 def gemini_key() -> str:
     return secret("GEMINI_API_KEY")
 
 
 def pollinations_key() -> str:
     return secret("POLLINATIONS_API_KEY")
+
+
+def pollinations_key_kind() -> str:
+    key = pollinations_key()
+    if key.startswith("pk_"):
+        return "publishable"
+    if key.startswith("sk_"):
+        return "secret"
+    return "unknown" if key else "missing"
+
+
+def comfyui_url() -> str:
+    value = secret("COMFYUI_URL") or "http://127.0.0.1:8188"
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return ""
+    return value.rstrip("/")
+
+
+def comfyui_workflow_path() -> str:
+    return secret("COMFYUI_WORKFLOW_JSON")
+
+
+def youtube_client_secret_path() -> str:
+    return secret("YOUTUBE_CLIENT_SECRET") or str(CACHE_DIR / "youtube" / "client_secret.json")
+
+
+def network_binding_requires_password(public_mode: bool, bind_address: object) -> bool:
+    """Require authentication for public mode and explicit non-loopback Streamlit binds."""
+    if public_mode:
+        return True
+    address = str(bind_address or "").strip().lower()
+    return address not in ("", "localhost", "127.0.0.1", "::1")
 
 
 def cloudflare_token() -> str:
@@ -81,7 +123,10 @@ def configured_providers() -> dict:
         "openrouter": bool(openrouter_key()),
         "cloudflare": bool(cloudflare_token()),
         "pixabay": bool(pixabay_key()),
+        "pexels": bool(pexels_key()),
         "gemini": bool(gemini_key()),
+        "pollinations": bool(pollinations_key()),
+        "sarvam": bool(sarvam_key()),
     }
 
 

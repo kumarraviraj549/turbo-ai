@@ -4,11 +4,12 @@ music direction, ending, YouTube metadata and one beat per scene.
 Stage B (fast models, parallel batches spread across providers): full cinematic scene breakdowns.
 Also: Auto Cinematic Mode (AI picks settings), script import, prompt enhancement, single-scene regeneration."""
 import concurrent.futures as cf
+import json
 import re
 import uuid
 from typing import Any, Callable, Dict, List, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from . import cinema, llm
 
@@ -59,10 +60,14 @@ class DialogueLine(BaseModel):
 
 
 class Scene(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     id: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])
     title: str = ""
     act: str = ""
     narration: str = ""
+    is_hero_scene: bool = False
+    hero_clip: str = ""
     dialogue: List[DialogueLine] = Field(default_factory=list)
     emotion: str = ""
     image_prompt: str = ""
@@ -86,6 +91,12 @@ class Scene(BaseModel):
     stock_query: str = ""
     duration: float = 0.0
     source: str = "original_motion"  # original_motion | ai_image | stock_video | ai_video | upload
+    video_source: str = Field(default="original_motion", alias="videoSource")
+    motion_preset: str = "dolly_in"
+    depth_intensity: str = "medium"
+    depth_dof: float = 0.15
+    procedural_template: str = Field(default="3d_bar_chart", alias="proceduralTemplate")
+    procedural_props: Dict[str, Any] = Field(default_factory=dict, alias="proceduralProps")
 
     @field_validator("dialogue", mode="before")
     @classmethod
@@ -269,7 +280,10 @@ def _scenes_prompt(treat: dict, style: str, beats: List[str], start_index: int, 
         beat_lines = "\n".join(f"{start_index + i + 1}. NARRATION: {t}" for i, t in enumerate(fixed_narration))
     return (
         f"FILM: {treat.get('title')} - {treat.get('logline')}\nSTYLE: {style}\nVISUAL IDENTITY: "
-        f"{treat.get('visual_identity')}\nSTORY: {treat.get('storyline')}\nCHARACTERS:\n{chars}\nENVIRONMENTS:\n{envs}\n"
+        f"{treat.get('visual_identity')}\nSTORY: {treat.get('storyline')}\n"
+        f"RESEARCH SOURCES (use exact entries for quote_evidence_card only):\n"
+        f"{json.dumps(treat.get('research_sources') or [], ensure_ascii=False)}\n"
+        f"CHARACTERS:\n{chars}\nENVIRONMENTS:\n{envs}\n"
         f"PREVIOUS SCENE: {prev_summary or 'this is the opening'}\n\n"
         f"Write scenes {start_index + 1}-{start_index + len(beats)} of {total} for these beats:\n{beat_lines}\n\n"
         f"Return JSON {{\"scenes\": [...]}} with EXACTLY {len(beats)} objects in order. Each object keys: title, act, "
@@ -279,7 +293,22 @@ def _scenes_prompt(treat: dict, style: str, beats: List[str], start_index: int, 
         "description for an AI video model: subject motion + camera motion); negative_prompt (comma list of things "
         "to avoid); camera_move; camera_angle; shot_type; lighting; atmosphere; animation; transition (into the NEXT scene); "
         "music_cue; sfx; ambience; overlay_text; overlay_kind; characters (names shown); environment (name); "
-        "stock_query (2-4 plain English words to find matching stock footage).\n"
+        "stock_query (2-4 plain English words to find matching stock footage); videoSource (default "
+        "\"original_motion\", use \"procedural_3d_2d\" for roughly 20-30% of scenes whose narration contains a "
+        "statistic, money amount, date, comparison, or a verified fact); proceduralTemplate (one of "
+        "\"3d_bar_chart\", \"3d_stat_callout\", \"comparison_split\", \"timeline_journey\", \"process_flow\", "
+        "\"quote_evidence_card\", \"2d_character_explainer\", or \"kinetic_hook_title\"); proceduralProps (strict JSON matching that template; quote_evidence_card "
+        "MUST cite an exact source supplied in Story/research sources and MUST NOT invent a citation). Use "
+        "\"original_motion\" and empty proceduralProps for ordinary narrative scenes.\n"
+        "Procedural property shapes: 3d_bar_chart={\"subtitle\":\"...\",\"unit\":\"...\",\"bars\":[{\"label\":\"...\","
+        "\"value\":12}]}; 3d_stat_callout={\"value\":12,\"prefix\":\"$\",\"suffix\":\"\",\"subtitle\":\"...\"}; "
+        "comparison_split={\"left\":{\"label\":\"A\",\"metrics\":[{\"label\":\"...\",\"value\":\"...\"}]},"
+        "\"right\":{\"label\":\"B\",\"metrics\":[{\"label\":\"...\",\"value\":\"...\"}]},\"winner\":\"A\"}; "
+        "timeline_journey={\"milestones\":[{\"year\":\"...\",\"label\":\"...\",\"caption\":\"...\"}]}; "
+        "process_flow={\"steps\":[{\"label\":\"...\",\"caption\":\"...\"}]}; "
+        "quote_evidence_card={\"quote\":\"...\",\"source\":\"exact user-provided source\",\"context\":\"...\"}.\n"
+        "2d_character_explainer={\"characterName\":\"...\",\"emotion\":\"explaining\",\"mouthStateTimeline\":[]}; "
+        "kinetic_hook_title={\"hookText\":\"...\",\"kicker\":\"WATCH THIS\"}. "
         "Vary shot types and camera moves for rhythm (wide -> medium -> close-up), use the opening scene for an "
         "establishing shot and a Title overlay with the film title, and keep continuity of characters and places.\n"
         + VOCAB
@@ -292,6 +321,47 @@ SYSTEM = ("You are an award-winning film director, screenwriter and cinematograp
 
 def _split_even(items: List[Any], size: int) -> List[List[Any]]:
     return [items[i: i + size] for i in range(0, len(items), size)]
+
+
+def extract_verified_facts(text: str, source: str = "User-provided transcript") -> Dict[str, Any]:
+    """Extracts source-bound facts without elevating unsupported model guesses to verified claims."""
+    content = str(text or "").strip()[:20000]
+    if not content:
+        raise ValueError("Paste article or transcript text first.")
+
+    def validate(data):
+        if not isinstance(data, dict) or not isinstance(data.get("facts"), list):
+            raise ValueError("Fact extractor returned an invalid object.")
+        facts = []
+        for item in data["facts"][:20]:
+            if not isinstance(item, dict):
+                continue
+            statement = _s(item.get("statement"))
+            citation = source
+            if statement:
+                facts.append({"statement": statement[:500], "citation": citation[:500]})
+        statistics = data.get("key_statistics", [])
+        if not isinstance(statistics, list):
+            statistics = []
+        safe_statistics = []
+        for item in statistics[:20]:
+            if isinstance(item, dict):
+                label, value = _s(item.get("label")), _s(item.get("value"))
+                if label and value:
+                    safe_statistics.append({"label": label[:150], "value": value[:100]})
+        return {"facts": facts, "key_statistics": safe_statistics}
+
+    prompt = (
+        "Extract only facts explicitly present in this source. Return JSON with facts: "
+        "[{statement,citation}] and key_statistics: [{label,value}]. "
+        "Citations must be exactly the supplied source identifier. Do not infer, embellish, or invent facts. "
+        "If the source does not support a claim, omit it. SOURCE: " + source + "\nTEXT:\n" + content
+    )
+    extracted, _ = llm.complete_json(
+        "You are a careful source-grounded fact extractor. Return strict JSON only.",
+        prompt, task="fast", max_tokens=1600, temperature=0.1, validate=validate, use_cache=False,
+    )
+    return extracted
 
 
 def split_script(script: str, n: int) -> List[str]:
@@ -410,7 +480,17 @@ def generate_plan(
     scenes: List[Scene] = []
     for bi in range(len(batches)):
         for raw in results[bi]:
-            sc = Scene(**{k: v for k, v in (raw or {}).items() if k in Scene.model_fields and k != "id"})
+            raw_scene = raw or {}
+            scene_values = {}
+            for name, field_info in Scene.model_fields.items():
+                if name == "id":
+                    continue
+                alias = field_info.alias
+                if name in raw_scene:
+                    scene_values[name] = raw_scene[name]
+                elif alias and alias in raw_scene:
+                    scene_values[name] = raw_scene[alias]
+            sc = Scene(**scene_values)
             scenes.append(sc.normalise(style, scene_duration))
     if fixed:
         for sc, txt in zip(scenes, fixed):
@@ -434,7 +514,17 @@ def regenerate_scene(plan: CinematicPlan, index: int, style: str, scene_duration
         SYSTEM, _scenes_prompt(treat, style, [beat], index, len(plan.scenes), scene_duration, language, prev),
         task="scenes", max_tokens=1800, temperature=0.9, use_cache=False, log=log,
         validate=lambda d: (d.get("scenes") if isinstance(d, dict) else d)[:1] or (_ for _ in ()).throw(ValueError("empty")))
-    new = Scene(**{k: v for k, v in data[0].items() if k in Scene.model_fields and k != "id"})
+    raw_scene = data[0]
+    scene_values = {}
+    for name, field_info in Scene.model_fields.items():
+        if name == "id":
+            continue
+        alias = field_info.alias
+        if name in raw_scene:
+            scene_values[name] = raw_scene[name]
+        elif alias and alias in raw_scene:
+            scene_values[name] = raw_scene[alias]
+    new = Scene(**scene_values)
     new.id = sc.id
     new.source = sc.source
     return new.normalise(style, scene_duration)

@@ -1,0 +1,19 @@
+{
+  "template": "3d_bar_chart",
+  "durationInSeconds": 5,
+  "aspect": "16:9",
+  "channelName": "Field Notes",
+  "title": "The signal is accelerating",
+  "brand": {
+    "primary": "#8B5CF6",
+    "secondary": "#22D3EE",
+    "accent": "#F472B6"
+  },
+  "subtitle": "A measured increase over five years",
+  "unit": "%",
+  "bars": [
+    {"label": "2020", "value": 34},
+    {"label": "2022", "value": 57},
+    {"label": "2025", "value": 91}
+  ]
+}

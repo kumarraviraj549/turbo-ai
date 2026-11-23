@@ -1,0 +1,16 @@
+{
+  "template": "3d_stat_callout",
+  "durationInSeconds": 5,
+  "aspect": "16:9",
+  "channelName": "Field Notes",
+  "title": "A decisive milestone",
+  "brand": {
+    "primary": "#8B5CF6",
+    "secondary": "#22D3EE",
+    "accent": "#F472B6"
+  },
+  "value": 42,
+  "prefix": "$",
+  "suffix": "B",
+  "subtitle": "A sample statistic from the story"
+}

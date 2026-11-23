@@ -15,8 +15,18 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 CF_CHAT_URL = "https://api.cloudflare.com/client/v4/accounts/{acc}/ai/v1/chat/completions"
 
-GROQ_MODELS = ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"]
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-flash-latest", "gemini-2.5-flash-lite", "gemini-flash-lite-latest"]
+GROQ_MODELS = ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "llama-3.3-70b-versatile", "openai/gpt-oss-20b"]
+GEMINI_DEFAULT_MODEL = "gemini-3.5-flash-lite"
+GEMINI_REASONING_MODEL = "gemini-3.8-flash"
+GEMINI_DAILY_LIMITS = {
+    GEMINI_DEFAULT_MODEL: 500,
+    "gemini-3.1-flash-lite": 500,
+    GEMINI_REASONING_MODEL: 20,
+    "gemini-3.6-flash": 20,
+}
+GEMINI_DEFAULT_FALLBACKS = [GEMINI_DEFAULT_MODEL, "gemini-3.1-flash-lite"]
+GEMINI_REASONING_FALLBACKS = [GEMINI_REASONING_MODEL, "gemini-3.6-flash"]
+GEMINI_MODELS = list(dict.fromkeys(GEMINI_DEFAULT_FALLBACKS + GEMINI_REASONING_FALLBACKS))
 CF_MODELS = ["@cf/openai/gpt-oss-120b", "@cf/zai-org/glm-5.3-flash", "@cf/meta/llama-3.3-70b-instruct-fp8-fast"]
 # Preferred free OpenRouter models for long creative writing (largest first); discovered list is intersected.
 OPENROUTER_FREE_PREFERENCE = [
@@ -30,9 +40,9 @@ OPENROUTER_FREE_PREFERENCE = [
 ]
 
 TASK_ORDER = {
-    "creative": ["openrouter", "groq"],
-    "scenes": ["groq", "openrouter"],
-    "fast": ["groq", "openrouter"],
+    "creative": ["gemini", "groq", "openrouter"],
+    "scenes": ["gemini", "groq", "openrouter"],
+    "fast": ["gemini", "groq", "openrouter"],
 }
 
 _openrouter_models_lock = threading.Lock()
@@ -179,6 +189,13 @@ def _call_cloudflare(model, system, user, max_tokens, temperature, json_mode, ti
 
 
 def _call_gemini(model, system, user, max_tokens, temperature, json_mode, timeout):
+    limit = GEMINI_DAILY_LIMITS.get(model)
+    if limit is None:
+        raise ProviderError("gemini", f"unsupported model {model}", status=404, fatal=True)
+    quota_key = f"gemini:{model}"
+    if not cache.reserve_daily_calls(quota_key, limit):
+        raise ProviderError("gemini", f"{model} local daily request limit reached ({limit} RPD)",
+                            status=429, fatal=True)
     body = {
         "systemInstruction": {"parts": [{"text": system}]},
         "contents": [{"parts": [{"text": user}]}],
@@ -196,9 +213,15 @@ def _call_gemini(model, system, user, max_tokens, temperature, json_mode, timeou
     return text
 
 
-def _backend_models(provider: str, preferred_openrouter: str = "") -> List[str]:
+def _backend_models(provider: str, preferred_openrouter: str = "", task: str = "fast") -> List[str]:
     if provider == "groq":
         return GROQ_MODELS if config.groq_key() else []
+    if provider == "gemini":
+        if not config.gemini_key():
+            return []
+        if task == "creative":
+            return GEMINI_REASONING_FALLBACKS + GEMINI_DEFAULT_FALLBACKS
+        return GEMINI_DEFAULT_FALLBACKS
     if provider == "openrouter":
         if not config.openrouter_key():
             return []
@@ -218,7 +241,7 @@ _CALLERS = {
 
 
 def available_backends() -> List[str]:
-    return [p for p in ("groq", "openrouter") if _backend_models(p)]
+    return [p for p in ("gemini", "groq", "openrouter") if _backend_models(p)]
 
 
 def complete_json(
@@ -250,7 +273,7 @@ def complete_json(
                 pass
     errors: List[str] = []
     for provider in order:
-        for model in _backend_models(provider, preferred_openrouter):
+        for model in _backend_models(provider, preferred_openrouter, task):
             if breaker_reason(f"{provider}:{model}") or breaker_reason(provider):
                 continue
             label = f"{provider}/{model}"
@@ -269,7 +292,7 @@ def complete_json(
                     # key/credit/quota problems disable the whole provider.
                     msg = str(e).lower()
                     model_scoped = (e.status in (400, 404) or (e.status == 403 and "not available on" in msg)
-                                    or (provider == "gemini" and e.status == 429))
+                                    or (provider in ("gemini", "groq", "openrouter") and e.status == 429))
                     scope = f"{provider}:{model}" if model_scoped else provider
                     trip_breaker(scope, str(e)[:160], seconds=quota_cooldown(provider, e))
                     if log:

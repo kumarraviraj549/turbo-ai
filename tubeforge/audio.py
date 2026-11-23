@@ -390,6 +390,82 @@ def decode(path: Path) -> np.ndarray:
     return np.frombuffer(res.stdout, dtype=np.float32).reshape(-1, 2)
 
 
+def _write_pcm_wav(path: Path, data: np.ndarray) -> None:
+    stereo = np.asarray(data, dtype=np.float32).reshape(-1, 2)
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(2)
+        output.setsampwidth(2)
+        output.setframerate(SR)
+        pcm = (np.clip(stereo, -1.0, 1.0) * 32767.0).astype("<i2")
+        output.writeframes(pcm.tobytes())
+
+
+def _rms_db(data: np.ndarray, eps: float = 1e-9) -> float:
+    rms = float(np.sqrt(np.mean(np.asarray(data, dtype=np.float32) ** 2) + eps))
+    return 20.0 * math.log10(max(rms, eps))
+
+
+def apply_speech_ducking(music: np.ndarray, voice: np.ndarray, target_db: float = -24.0,
+                        attack_seconds: float = 0.150, release_seconds: float = 0.400) -> np.ndarray:
+    """Apply deterministic RMS-envelope ducking, calibrated in dB relative to narration."""
+    music = np.asarray(music, dtype=np.float32)
+    voice = np.asarray(voice, dtype=np.float32)
+    length = min(music.shape[0], voice.shape[0])
+    if length <= 0:
+        return music
+    music, voice = music[:length], voice[:length]
+
+    window = max(1, int(0.050 * SR))
+    mono_voice = voice.mean(axis=1)
+    mono_music = music.mean(axis=1)
+    padded_voice = np.pad(mono_voice, (window // 2, window // 2), mode="edge")
+    voice_rms = np.sqrt(np.convolve(padded_voice * padded_voice,
+                                     np.ones(window, dtype=np.float32) / window, mode="same")[:length])
+    padded_music = np.pad(mono_music, (window // 2, window // 2), mode="edge")
+    music_rms = np.sqrt(np.convolve(padded_music * padded_music,
+                                     np.ones(window, dtype=np.float32) / window, mode="same")[:length])
+    rms = voice_rms
+    active_floor = max(float(np.percentile(rms, 20)), 1e-5)
+    active = rms > max(active_floor * 2.5, 0.003)
+
+    target_db = float(np.clip(target_db, -26.0, -22.0))
+    ratio = 10.0 ** (float(np.clip(target_db, -26.0, -22.0)) / 20.0)
+    desired = np.ones(length, dtype=np.float32)
+    active_indices = np.flatnonzero(active)
+    if active_indices.size:
+        desired[active_indices] = np.clip(
+            (voice_rms[active_indices] * ratio) / np.maximum(music_rms[active_indices], 1e-9),
+            0.01, 1.0,
+        )
+
+    attack = max(1, int(attack_seconds * SR))
+    release = max(1, int(release_seconds * SR))
+    gains = np.ones(length, dtype=np.float32)
+    current = 1.0
+    for index in range(length):
+        target = desired[index]
+        if target < current:
+            alpha = 1.0 / attack
+        else:
+            alpha = 1.0 / release
+        current += (target - current) * alpha
+        gains[index] = current
+
+    pause_boost = np.ones(length, dtype=np.float32)
+    pause_frames = int(0.600 * SR)
+    i = 0
+    while i < length:
+        if active[i]:
+            i += 1
+            continue
+        start = i
+        while i < length and not active[i]:
+            i += 1
+        if i - start >= pause_frames:
+            pause_boost[start:i] = 10.0 ** (6.0 / 20.0)
+    return (music * gains[:, None] * pause_boost[:, None]).astype(np.float32)
+
+
 class Track:
     """Disk-backed stereo timeline (keeps RAM flat for long 50-scene films)."""
 
@@ -464,45 +540,47 @@ def build_music(out: Path, total: float, mood: str, cues: List[Tuple[float, floa
 
 def mix_final(voice: Optional[Path], music: Optional[Path], fx: Optional[Path], out: Path, total: float,
               voice_vol: float = 1.0, music_vol: float = 0.35, fx_vol: float = 0.5, duck: float = 0.6,
-              loudness: float = -14.0) -> Path:
-    """Ducks music under the voice (sidechain), mixes stems, normalises loudness (EBU R128)."""
-    inputs, labels, segs = [], [], []
-    idx = 0
-    if voice:
-        inputs += ["-i", str(voice)]
-        segs.append(f"[{idx}:a]volume={voice_vol:.2f},asplit=2[v][vsc]")
-        labels.append("[v]")
-        vi = idx
-        idx += 1
-    else:
-        vi = None
-    if music:
-        inputs += ["-i", str(music)]
-        mlab = f"[{idx}:a]volume={music_vol:.2f}"
-        if vi is not None and duck > 0:
-            segs.append(f"{mlab}[mraw]")
-            ratio = 2 + 10 * duck
-            segs.append(f"[mraw][vsc]sidechaincompress=threshold=0.02:ratio={ratio:.1f}:attack=30:release=500:"
-                        f"makeup=1[m]")
-        else:
-            segs.append(f"{mlab}[m]")
-            if vi is not None:
-                segs.append("[vsc]anullsink")
-        labels.append("[m]")
-        idx += 1
-    elif vi is not None:
-        segs.append("[vsc]anullsink")
-    if fx:
-        inputs += ["-i", str(fx)]
-        segs.append(f"[{idx}:a]volume={fx_vol:.2f}[f]")
-        labels.append("[f]")
-        idx += 1
-    if not labels:
+              loudness: float = -14.0, duck_db: Optional[float] = None) -> Path:
+    """Mix stems with deterministic speech-envelope ducking and EBU R128 mastering."""
+    voice_audio = decode(voice) * float(voice_vol) if voice else None
+    music_audio = decode(music) * float(music_vol) if music else None
+    fx_audio = decode(fx) * float(fx_vol) if fx else None
+    length = max(1, int(total * SR))
+
+    if voice_audio is not None:
+        tmp_voice = out.with_suffix(".voice-clean.wav")
+        _write_pcm_wav(tmp_voice, voice_audio)
+        cleaned = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(tmp_voice),
+             "-af", "highpass=f=80,acompressor=threshold=0.125:ratio=2.5:attack=20:release=250:makeup=1",
+             "-ar", str(SR), "-ac", "2", str(out.with_suffix(".voice.wav"))],
+            capture_output=True,
+            check=False,
+        )
+        tmp_voice.unlink(missing_ok=True)
+        if cleaned.returncode:
+            raise RuntimeError(f"voice cleanup failed: {cleaned.stderr[-400:]}")
+        voice_clean_path = out.with_suffix(".voice.wav")
+        voice_audio = decode(voice_clean_path)
+
+    if music_audio is not None and voice_audio is not None:
+        target_db = -24.0 if duck_db is None else float(duck_db)
+        if duck_db is None:
+            target_db = float(np.clip(-22.0 - 4.0 * float(duck), -26.0, -22.0))
+        music_audio = apply_speech_ducking(music_audio, voice_audio, target_db=target_db)
+
+    stems = [stem for stem in (voice_audio, music_audio, fx_audio) if stem is not None]
+    if not stems:
         raise RuntimeError("nothing to mix")
-    segs.append(f"{''.join(labels)}amix=inputs={len(labels)}:normalize=0:dropout_transition=0,"
-                f"loudnorm=I={loudness}:TP=-1.5:LRA=11,alimiter=limit=0.95,atrim=0:{total:.3f}[out]")
-    cmd = ["ffmpeg", "-y", "-v", "error", *inputs, "-filter_complex", ";".join(segs), "-map", "[out]", "-ar",
-           str(SR), "-ac", "2", str(out)]
+    mixed = np.zeros((length, 2), dtype=np.float32)
+    for stem in stems:
+        n = min(length, stem.shape[0])
+        mixed[:n] += stem[:n].astype(np.float32)
+    premix = out.with_suffix(".premix.wav")
+    _write_pcm_wav(premix, mixed)
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(premix),
+           "-af", f"loudnorm=I={loudness}:TP=-1.5:LRA=11,alimiter=limit=0.95,atrim=0:{total:.3f}",
+           "-ar", str(SR), "-ac", "2", str(out)]
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode != 0:
         raise RuntimeError(f"audio mix failed: {res.stderr[-400:]}")
