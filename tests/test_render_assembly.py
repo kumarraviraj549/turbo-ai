@@ -92,7 +92,13 @@ class VideoDecodabilityTests(unittest.TestCase):
                 output.write_bytes(b"output")
                 return output
 
+            def write_sidecar(_chunks, output):
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text("", encoding="utf-8")
+                return output
+
             def write_assembly(_clips, _durations, _transitions, output, *_args, **_kwargs):
+                Path(output).parent.mkdir(parents=True, exist_ok=True)
                 Path(output).write_bytes(b"assembled")
 
             with patch.object(jobs, "STUDIO_ROOT", root / "projects"), \
@@ -100,8 +106,8 @@ class VideoDecodabilityTests(unittest.TestCase):
                     patch.object(jobs.audio, "mix_final", side_effect=lambda *args, **kwargs: root / "mix.m4a"), \
                     patch.object(jobs.render, "assemble_video", side_effect=write_assembly), \
                     patch.object(jobs.render, "export_final", side_effect=write_output) as export_final, \
-                    patch.object(jobs.render, "write_srt", side_effect=write_output), \
-                    patch.object(jobs.render, "write_vtt", side_effect=write_output), \
+                    patch.object(jobs.render, "write_srt", side_effect=write_sidecar), \
+                    patch.object(jobs.render, "write_vtt", side_effect=write_sidecar), \
                     patch.object(jobs.render, "make_thumbnail", side_effect=write_output), \
                     patch.object(jobs.render, "write_kinetic_ass") as write_ass:
                 jobs.assemble_film(project, threading.Event())
