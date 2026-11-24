@@ -4,6 +4,7 @@ Every scene asset (image / footage / voice / clip) stores a fingerprint of its i
 regenerates what actually changed and an interrupted job resumes where it stopped."""
 import concurrent.futures as cf
 import copy
+import ctypes
 import hashlib
 import html
 import html.parser
@@ -25,8 +26,9 @@ import zipfile
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from . import alignment, audio, cinema, images, planner, procedural, quality, render, tts, video
+from . import alignment, audio, cinema, comfyui_bridge, images, otio_export, planner, procedural, quality, render, timeline_qa, tts, video
 from .config import STUDIO_ROOT
+from workers import blender_worker, manim_worker
 
 LEAD_IN = 0.35
 TAIL = 0.45
@@ -56,12 +58,18 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "allow_paid_video": False, "paid_video_provider": "openrouter", "paid_video_budget_usd": 0.0,
     "paid_video_spent_usd": 0.0, "hero_video_budget_count": 0, "hero_video_budget_seconds": 0.0,
     "hero_gpu_budget_minutes": 0.0, "comfyui_url": "", "comfyui_workflow_json": "",
+    "comfyui_video_preset": "wan22_video", "comfyui_edit_preset": "flux_kontext_edit",
+    "comfyui_edit_workflow_json": "", "comfyui_lipsync_preset": "musetalk_lipsync",
+    "comfyui_lipsync_workflow_json": "",
     "comfyui_remote": False, "frame_interpolation": "none", "upscale_stills": False,
+    "vulkan_upscale": False,
     "export_encoder": "auto", "export_bitrate_mbps": 0, "export_passes": 1,
     "export_master": "none", "export_rec709": True, "keyframe_interval": 2,
     "pronunciation_dictionary": {}, "pause_emphasis": {}, "enable_dubbing": False,
     "strict_loudness_gate": True,
     "local_music_generator": "none", "chapter_music_moods": {}, "beat_sync_cuts": False,
+    "local_foley": False, "local_voice_reference_path": "", "local_voice_clone_consent": False,
+    "auto_trim_silence": False, "lut_path": "", "lut_strength": 1.0,
     "fact_check_mode": "acknowledge", "unsupported_claim_policy": "acknowledge",
     "live_research_enabled": False, "source_records": [],
     "thumbnail_cutout": False, "youtube_contains_synthetic_media": False,
@@ -74,6 +82,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "channel_name": "", "channel_logo_path": "", "brand_position": "Top-Right",
     "voice_branding": True, "brand_overlay": True, "target_duration": 120.0,
     "fade_in": 0.6, "fade_out": 1.2, "workers": 3, "seed": 0, "title_card": True,
+    "max_render_workers": 2, "encoding_mode": "auto",
     "halation": 0.0, "gate_weave": False, "end_card": True, "end_card_cta": "", "end_card_len": 5.0,
     "shorts_teaser": True, "teaser_len": 45.0, "transition_sfx": True, "thumb_variants": True,
     "youtube_category_id": "27", "youtube_default_language": "",
@@ -142,6 +151,12 @@ def load_channel_library(name: str) -> Dict[str, Any]:
         "brandPalette": data.get("brandPalette", {}),
         "captionPreset": data.get("captionPreset", "Hormozi Bounce"),
         "narratorVoice": data.get("narratorVoice", {}),
+        "luts": [
+            item for item in (data.get("luts") if isinstance(data.get("luts"), list) else [])
+            if isinstance(item, dict) and Path(str(item.get("path", ""))).suffix.lower() == ".cube"
+            and Path(str(item.get("path", ""))).parent.resolve() == (channel_dir(name) / "luts").resolve()
+            and Path(str(item.get("path", ""))).is_file()
+        ],
     }
 
 
@@ -155,11 +170,95 @@ def save_channel_library(name: str, library: Dict[str, Any]) -> Path:
         "brandPalette": library.get("brandPalette", {}),
         "captionPreset": library.get("captionPreset", "Hormozi Bounce"),
         "narratorVoice": library.get("narratorVoice", {}),
+        "luts": library.get("luts", []),
     }
     temporary = path.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(safe, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(path)
     return path
+
+
+def save_channel_lut(name: str, filename: str, contents: bytes) -> Dict[str, str]:
+    if not filename.lower().endswith(".cube"):
+        raise ValueError("Upload an Adobe .cube 3D LUT file.")
+    if len(contents) > 4 * 1024 * 1024:
+        raise ValueError("A .cube LUT must be no larger than 4 MiB.")
+    try:
+        text = contents.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError("The .cube LUT must be UTF-8 text.") from exc
+    render.validate_cube_lut_text(text)
+    directory = channel_dir(name) / "luts"
+    directory.mkdir(parents=True, exist_ok=True)
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "_", Path(filename).stem).strip("_")[:48] or "custom_lut"
+    digest = hashlib.sha256(contents).hexdigest()
+    destination = directory / f"{stem}_{digest[:12]}.cube"
+    if not destination.is_file():
+        temporary = destination.with_suffix(".cube.tmp")
+        temporary.write_bytes(contents)
+        temporary.replace(destination)
+    library = load_channel_library(name)
+    luts = [item for item in library["luts"] if item.get("path") != str(destination)]
+    luts.append({"name": Path(filename).stem[:80], "path": str(destination)})
+    library["luts"] = luts
+    save_channel_library(name, library)
+    return {"name": Path(filename).stem[:80], "path": str(destination)}
+
+
+def save_procedural_model(p: "Project", uploads: List[Tuple[str, bytes]]) -> str:
+    if not uploads or len(uploads) > 16:
+        raise ValueError("Choose one model file and up to fifteen glTF texture/buffer files.")
+    total_bytes = sum(len(contents) for _, contents in uploads)
+    if total_bytes > 256 * 1024 * 1024:
+        raise ValueError("A procedural model and its assets must total no more than 256 MiB.")
+    files: Dict[str, bytes] = {}
+    for filename, contents in uploads:
+        name = Path(str(filename).replace("\\", "/")).name
+        if not name or name in (".", "..") or "/" in name or name in files:
+            raise ValueError("Model asset filenames must be unique simple filenames.")
+        files[name] = contents
+    model_names = [name for name in files if Path(name).suffix.lower() in (".glb", ".gltf")]
+    if len(model_names) != 1:
+        raise ValueError("Upload exactly one .glb or .gltf model.")
+    model_name = model_names[0]
+    if Path(model_name).suffix.lower() == ".gltf":
+        try:
+            document = json.loads(files[model_name].decode("utf-8-sig"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("The .gltf model must be valid UTF-8 JSON.") from exc
+        references = []
+        for collection in ("buffers", "images"):
+            resources = document.get(collection, [])
+            if not isinstance(resources, list) or any(not isinstance(entry, dict) for entry in resources):
+                raise ValueError(f"The glTF {collection} field must be an array of objects.")
+            for entry in resources:
+                uri = entry.get("uri", "")
+                if not isinstance(uri, str):
+                    raise ValueError(f"Every glTF {collection} URI must be text.")
+                if not uri or uri.startswith("data:"):
+                    continue
+                decoded = urllib.parse.unquote(uri).replace("\\", "/")
+                if "/" in decoded or decoded in (".", "..") or decoded not in files:
+                    raise ValueError(
+                        f"Upload the referenced glTF asset {uri!r} alongside the .gltf file; "
+                        "subdirectories and remote asset URLs are not supported."
+                    )
+                references.append(decoded)
+    digest_builder = hashlib.sha256()
+    for name in sorted(files):
+        digest_builder.update(name.encode("utf-8"))
+        digest_builder.update(b"\0")
+        digest_builder.update(hashlib.sha256(files[name]).digest())
+    digest = digest_builder.hexdigest()[:20]
+    destination = p.dir / "remotion_public" / "models" / digest
+    destination.mkdir(parents=True, exist_ok=True)
+    for name, contents in files.items():
+        target = destination / name
+        if not target.is_file():
+            temporary = target.with_suffix(target.suffix + ".tmp")
+            temporary.write_bytes(contents)
+            temporary.replace(target)
+    return f"models/{digest}/{model_name}"
 
 
 def load_series_history(name: str, limit: int = 25) -> List[dict]:
@@ -845,8 +944,10 @@ def ensure_image(p: Project, sc: planner.Scene, log: Callable[[str], None]) -> P
         st.update(image_fp=fp, image=str(out), image_engine=res.engine, image_model=res.model,
                   image_warnings=res.warnings, image_prompt_used=prompt)
         if res.engine in ("pexels", "pixabay"):
-            st.update(image_provider="Pexels" if res.engine == "pexels" else "Pixabay",
-                      image_credit=res.model)
+            provider = "Local Vault" if str(res.model).startswith("Local vault") else (
+                "Pexels" if res.engine == "pexels" else "Pixabay"
+            )
+            st.update(image_provider=provider, image_credit=res.model)
         else:
             st.pop("image_provider", None)
             st.pop("image_credit", None)
@@ -917,9 +1018,16 @@ def ensure_visual(p: Project, sc: planner.Scene, log: Callable[[str], None],
                 log("🎥 ComfyUI source needs a URL and an exported API workflow.")
             else:
                 try:
-                    workflow = video.import_comfy_workflow(Path(workflow_path))
+                    preset = str(s.get("comfyui_video_preset", "wan22_video"))
+                    comfyui_bridge.validate_endpoint(
+                        base_url,
+                        allow_remote=(src == "comfyui_remote" and bool(s.get("allow_remote_comfy", False))),
+                    )
+                    workflow = comfyui_bridge.prepare_video_workflow(
+                        preset, Path(workflow_path), sc.video_prompt or sc.image_prompt or sc.title,
+                    )
                     out = p.scene_dir(sc.id) / "comfyui.mp4"
-                    fp = _fp("comfyui", base_url, workflow_path, sc.video_prompt, st.get("seed"),
+                    fp = _fp("comfyui", base_url, workflow_path, preset, sc.video_prompt, st.get("seed"),
                              sc.duration)
                     if st.get("comfyui_fp") == fp and out.is_file():
                         return "video", out
@@ -1038,7 +1146,10 @@ def ensure_voice(p: Project, sc: planner.Scene, log: Callable[[str], None]) -> L
         path = p.scene_dir(sc.id) / f"voice_{i}{suffix}"
         res = tts.synthesize(text, path, engine=engine, voice=voice_id, speed=s["voice_speed"],
                              pitch_hz=int(s["voice_pitch"]), emotion=sc.emotion, log=log,
-                             language=s.get("language", "English"))
+                             language=s.get("language", "English"),
+                             voice_reference_path=Path(s["local_voice_reference_path"])
+                             if s.get("local_voice_reference_path") else None,
+                             voice_clone_consent=bool(s.get("local_voice_clone_consent", False)))
         for warning in res.warnings:
             log(f"⚠️ {warning}")
         out_parts.append({"path": str(res.path), "offset": cursor, "duration": res.duration, "voice": res.voice,
@@ -1083,6 +1194,27 @@ def render_spec(p: Project, sc: planner.Scene, idx: int, kind: str, src: Path, c
     anim = sc.animation
     if sc.source == "original_motion" and anim == "None":
         anim = "Parallax depth"
+    procedural_props = {}
+    if sc.video_source == "procedural_3d_2d":
+        procedural_props = procedural.scene_props(
+            sc, s, clip_len, p.plan.research_sources if p.plan else [],
+            model_public_dir=p.dir / "remotion_public",
+        )
+        if sc.procedural_template == "2d_character_explainer" and not procedural_props["mouthStateTimeline"]:
+            parts = p.state(sc.id).get("voice_parts", [])
+            if parts:
+                procedural_props["mouthStateTimeline"] = alignment.build_mouth_state_timeline(
+                    [(Path(part["path"]), LEAD_IN + float(part.get("offset", 0.0))) for part in parts],
+                    int(s["fps"]), p.scene_dir(sc.id) / "mouth_states.json",
+                )
+    lut_path = Path(str(s.get("lut_path", ""))) if s.get("lut_path") else None
+    if lut_path is not None:
+        if not lut_path.is_file() or lut_path.suffix.lower() != ".cube":
+            raise RuntimeError(f"Selected 3D LUT is missing or is not a .cube file: {lut_path}")
+        try:
+            render.validate_cube_lut_text(lut_path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise RuntimeError(f"Selected 3D LUT is invalid: {exc}") from exc
     return render.SceneRenderSpec(
         out_path=p.scene_dir(sc.id) / "clip.mp4", width=W, height=H, fps=int(s["fps"]), duration=clip_len,
         source_type=kind, source_path=src, camera=sc.camera_move, intensity=float(s["camera_intensity"]),
@@ -1092,6 +1224,7 @@ def render_spec(p: Project, sc: planner.Scene, idx: int, kind: str, src: Path, c
         letterbox=bool(s["letterbox"]), dof=float(s["dof"]) + (0.15 if anim == "Parallax depth" else 0.0),
         chroma=float(s["chroma"]) + (0.6 if anim == "Chromatic aberration" else 0.0),
         sharpen=float(s["sharpen"]), motion_blur=anim == "Motion blur", animation=anim,
+        lut_path=lut_path, lut_strength=float(s.get("lut_strength", 1.0)),
         halation=float(s.get("halation", 0.0)), gate_weave=bool(s.get("gate_weave", False)),
         caption_chunks=chunks,
         caption_style="None" if s.get("kinetic_captions", False) else s["subtitle_style"],
@@ -1099,15 +1232,15 @@ def render_spec(p: Project, sc: planner.Scene, idx: int, kind: str, src: Path, c
         overlay_start=0.4, overlay_end=max(1.5, min(4.5, clip_len - 1.0)), seed=int(p.state(sc.id).get("seed", 1)),
         video_source=sc.video_source, motion_preset=sc.motion_preset,
         depth_intensity=sc.depth_intensity, depth_dof=float(sc.depth_dof), scene_index=idx + 1,
-        procedural_props=procedural.scene_props(
-            sc, s, clip_len, p.plan.research_sources if p.plan else [],
-        ) if sc.video_source == "procedural_3d_2d" else {},
+        procedural_props=procedural_props,
+        encoder=("libx264" if s.get("encoding_mode") == "cpu" else
+                 render.detect_video_encoder()["recommended"]),
         resample=s.get("resample", "bilinear"),
         channel_name=str(s.get("channel_name", "")),
         channel_logo_path=Path(s["channel_logo_path"]) if s.get("channel_logo_path") and Path(s["channel_logo_path"]).exists() else None,
         brand_position=str(s.get("brand_position", "Top-Right")),
         brand_overlay=bool(s.get("brand_overlay", True)),
-        work_dir=p.scene_dir(sc.id) / "work")
+        work_dir=p.scene_dir(sc.id) / "work", public_dir=p.dir / "remotion_public")
 
 
 def preview_procedural_scene(p: Project, scene_id: str, should_cancel: Callable[[], bool]) -> Path:
@@ -1127,11 +1260,15 @@ def preview_procedural_scene(p: Project, scene_id: str, should_cancel: Callable[
         "output": str(output),
         "scene_index": index + 1,
         "frame": int(duration * p.settings["fps"] / 2),
-        "props": procedural.scene_props(sc, p.settings, duration, plan.research_sources),
+        "props": procedural.scene_props(
+            sc, p.settings, duration, plan.research_sources,
+            model_public_dir=p.dir / "remotion_public",
+        ),
         "duration": duration,
         "width": width,
         "height": height,
         "fps": int(p.settings["fps"]),
+        "public_dir": str(p.dir / "remotion_public"),
     }
     worker = Path(__file__).resolve().parents[1] / "workers" / "procedural_worker.py"
     render._run_motion_worker(worker, payload, p.scene_dir(sc.id) / "work", should_cancel)
@@ -1141,8 +1278,12 @@ def preview_procedural_scene(p: Project, scene_id: str, should_cancel: Callable[
 
 def spec_fingerprint(spec: render.SceneRenderSpec) -> str:
     d = {k: (str(v) if isinstance(v, Path) else v) for k, v in spec.__dict__.items()
-         if k not in ("out_path", "work_dir", "caption_chunks", "video_source", "motion_preset",
-                      "depth_intensity", "depth_dof", "scene_index", "procedural_props")}
+         if k not in ("out_path", "work_dir", "public_dir", "caption_chunks", "video_source", "motion_preset",
+                      "depth_intensity", "depth_dof", "scene_index", "procedural_props",
+                      "lut_path", "lut_strength")}
+    if spec.lut_path:
+        d["lut_strength"] = float(spec.lut_strength)
+        d["lut_sha256"] = _reference_sig(str(spec.lut_path))
     if spec.video_source != "original_motion":
         d["videoSource"] = spec.video_source
         d["motion_preset"] = spec.motion_preset
@@ -1158,6 +1299,46 @@ def spec_fingerprint(spec: render.SceneRenderSpec) -> str:
 # ---------------------------------------------------------------------------------------------- jobs
 class Cancelled(RuntimeError):
     pass
+
+
+def _render_worker_count(requested: int) -> int:
+    limit = max(1, min(4, int(requested)))
+    env_limit = os.environ.get("MAX_RENDER_WORKERS")
+    if env_limit:
+        try:
+            limit = max(1, min(4, int(env_limit)))
+        except ValueError as exc:
+            raise ValueError("MAX_RENDER_WORKERS must be an integer from 1 to 4.") from exc
+    limit = min(limit, max(1, (os.cpu_count() or 1) // 2))
+    try:
+        import psutil
+        available_ram = int(psutil.virtual_memory().available)
+    except ImportError:
+        available_ram = 0
+        if os.name == "nt":
+            class MemoryStatus(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            status = MemoryStatus()
+            status.dwLength = ctypes.sizeof(status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                available_ram = int(status.ullAvailPhys)
+    if available_ram:
+        limit = min(limit, max(1, available_ram // (2 * 1024 ** 3)))
+    return max(1, limit)
+
+
+def _render_scene_process(spec: render.SceneRenderSpec, cancel_path: str) -> Tuple[str, List[str]]:
+    messages = []
+    path = render.render_scene(
+        spec, should_cancel=lambda: Path(cancel_path).exists(), log=messages.append,
+    )
+    return str(path), messages
 
 
 class JobManager:
@@ -1332,7 +1513,8 @@ def _set_scene(p: Project, sid: str, **kw) -> None:
     p.save(force=False)
 
 
-def produce_scene(p: Project, sc: planner.Scene, idx: int, n: int, ev: threading.Event, assets_only: bool = False
+def produce_scene(p: Project, sc: planner.Scene, idx: int, n: int, ev: threading.Event, assets_only: bool = False,
+                  render_pool=None, cancel_path: Optional[Path] = None
                   ) -> Optional[Dict[str, Any]]:
     def log(m):
         p.log(f"[{idx + 1}/{n}] {m}")
@@ -1355,6 +1537,37 @@ def produce_scene(p: Project, sc: planner.Scene, idx: int, n: int, ev: threading
             return {"len": clip_len}
         chunks = caption_chunks(p, parts, clip_len, trans_out)
         spec = render_spec(p, sc, idx, kind, src, clip_len, chunks)
+        worker_clip = None
+        if sc.video_source == "manim_math":
+            worker_config = {
+                **(sc.procedural_props or {}),
+                "template": (sc.procedural_props or {}).get("worker_template", "compounding_curve"),
+                "title": sc.title, "duration": clip_len, "width": spec.width, "height": spec.height,
+                "fps": spec.fps, "output": str(p.scene_dir(sc.id) / "manim_worker.mp4"),
+            }
+            try:
+                worker_clip = Path(manim_worker.run(worker_config)["output"])
+            except Exception as exc:
+                log(f"⚠️ Manim template worker unavailable; using the selected local renderer: {exc}")
+        elif sc.video_source == "blender_3d":
+            model_path = ""
+            model_url = str((sc.procedural_props or {}).get("modelUrl", "")).replace("\\", "/")
+            if model_url:
+                model_path = str((p.dir / "remotion_public" / model_url).resolve())
+            worker_config = {
+                "project_root": str(p.dir.resolve()), "model_path": model_path,
+                "duration": clip_len, "width": spec.width, "height": spec.height, "fps": spec.fps,
+                "model_scale": (sc.procedural_props or {}).get("modelScale", 1.0),
+                "output": str(p.scene_dir(sc.id) / "blender_worker.mp4"),
+            }
+            try:
+                worker_clip = Path(blender_worker.run(worker_config)["output"])
+            except Exception as exc:
+                log(f"⚠️ Blender flythrough worker unavailable; using the selected local renderer: {exc}")
+        if worker_clip and worker_clip.is_file():
+            kind, src = "video", worker_clip
+            spec.source_type, spec.source_path = "video", worker_clip
+            spec.video_source, spec.camera = "original_motion", "Static (locked off)"
         fp = spec_fingerprint(spec)
         st = p.state(sc.id)
         cached = st.get("clip_fp") == fp and spec.out_path.exists()
@@ -1364,8 +1577,24 @@ def produce_scene(p: Project, sc: planner.Scene, idx: int, n: int, ev: threading
         if not cached:
             _set_scene(p, sc.id, status="rendering", progress=0.4)
             t0 = time.time()
-            render.render_scene(spec, progress=lambda f: _set_scene(p, sc.id, progress=0.4 + 0.6 * f),
-                                should_cancel=cancelled, log=log)
+            if render_pool is None:
+                render.render_scene(spec, progress=lambda f: _set_scene(p, sc.id, progress=0.4 + 0.6 * f),
+                                    should_cancel=cancelled, log=log)
+            else:
+                future = render_pool.submit(_render_scene_process, spec, str(cancel_path))
+                while True:
+                    if cancelled():
+                        cancel_path.touch()
+                        future.cancel()
+                        raise Cancelled()
+                    try:
+                        _, render_messages = future.result(timeout=0.25)
+                        for message in render_messages:
+                            log(message)
+                        break
+                    except cf.TimeoutError:
+                        continue
+                _set_scene(p, sc.id, progress=0.9)
             if not render.video_is_decodable(spec.out_path, cancelled):
                 spec.out_path.unlink(missing_ok=True)
                 raise RuntimeError(f"Rendered clip for “{sc.title}” is incomplete or cannot be decoded.")
@@ -1392,6 +1621,8 @@ def _align_project_voice(p: Project) -> List[dict]:
         source = Path(external_voiceover)
         if not source.is_file():
             raise RuntimeError(f"Imported voiceover is missing: {source}")
+        if p.settings.get("auto_trim_silence", False):
+            source = audio.trim_silence(source, p.dir / "work" / "trimmed_voiceover")
         durations = [max(float(scene.duration), 0.1) for scene in plan.scenes]
         transitions = [scene_transition(p, scene)[1] for scene in plan.scenes[:-1]]
         scene_runtime = render.total_length(durations, transitions)
@@ -1453,6 +1684,11 @@ def produce(p: Project, ev: threading.Event, scene_ids: Optional[List[str]], ass
     todo = [(i, sc) for i, sc in enumerate(scenes) if assemble or not scene_ids or sc.id in scene_ids]
     p.log(f"▶️ Producing {len(todo)} scene(s){' + final film' if assemble else ''}")
     workers = max(1, int(p.settings.get("workers") or 3))
+    render_workers = _render_worker_count(int(p.settings.get("max_render_workers") or 2))
+    p.log(f"🧵 Rendering scene clips with {render_workers} process worker(s).")
+    cancel_path = p.dir / "work" / "render.cancel"
+    cancel_path.parent.mkdir(parents=True, exist_ok=True)
+    cancel_path.unlink(missing_ok=True)
     done = [0]
 
     def upd():
@@ -1461,19 +1697,24 @@ def produce(p: Project, ev: threading.Event, scene_ids: Optional[List[str]], ass
             p.data["job"].update(progress=frac * (0.85 if assemble else 1.0),
                                  stage=f"Scenes {done[0]}/{len(todo)} complete")
 
-    with cf.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tf-scene") as ex:
-        futs = {ex.submit(produce_scene, p, sc, i, n, ev, assets_only): sc for i, sc in todo}
-        pending = set(futs)
-        while pending:
-            fin, pending = cf.wait(pending, timeout=1.0, return_when=cf.FIRST_COMPLETED)
-            for f in fin:
-                done[0] += 1
-                try:
-                    f.result()
-                except (Cancelled, render.Cancelled):
-                    pass
-            upd()
-            p.save(force=False)
+    with cf.ProcessPoolExecutor(max_workers=render_workers) as render_pool:
+        with cf.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tf-scene") as ex:
+            futs = {ex.submit(produce_scene, p, sc, i, n, ev, assets_only, render_pool, cancel_path): sc
+                    for i, sc in todo}
+            pending = set(futs)
+            while pending:
+                fin, pending = cf.wait(pending, timeout=1.0, return_when=cf.FIRST_COMPLETED)
+                if ev.is_set():
+                    cancel_path.touch()
+                for f in fin:
+                    done[0] += 1
+                    try:
+                        f.result()
+                    except (Cancelled, render.Cancelled):
+                        pass
+                upd()
+                p.save(force=False)
+    cancel_path.unlink(missing_ok=True)
     if ev.is_set():
         raise Cancelled()
     retry = [(i, sc) for i, sc in todo if p.state(sc.id).get("status") == "error"]
@@ -1723,18 +1964,21 @@ def assemble_film(p: Project, ev: threading.Event) -> None:
     cues = []
     external_voiceover = s.get("external_voiceover_path", "")
     has_voice = bool(external_voiceover)
-    if external_voiceover:
-        if not Path(external_voiceover).exists():
-            raise RuntimeError(f"Imported voiceover is missing: {external_voiceover}")
-        voiceover_duration = tts.probe_duration(Path(external_voiceover))
+    external_audio = Path(external_voiceover) if external_voiceover else None
+    if external_audio:
+        if not external_audio.is_file():
+            raise RuntimeError(f"Imported voiceover is missing: {external_audio}")
+        if s.get("auto_trim_silence", False):
+            external_audio = audio.trim_silence(external_audio, work / "trimmed_voiceover")
+        voiceover_duration = tts.probe_duration(external_audio)
         if voiceover_duration <= 0:
-            raise RuntimeError(f"Could not read imported voiceover duration: {external_voiceover}")
+            raise RuntimeError(f"Could not read imported voiceover duration: {external_audio}")
         if voiceover_duration > total + 0.05:
             raise RuntimeError(
                 f"Imported voiceover is {voiceover_duration:.1f}s but the film timeline is {total:.1f}s; "
                 "extend the project duration before rendering."
             )
-        voice_tr.add(audio.decode(Path(external_voiceover)), 0.0, 1.0)
+        voice_tr.add(audio.decode(external_audio), 0.0, 1.0)
     for i, sc in enumerate(scenes):
         st = p.state(sc.id)
         S = starts[i]
@@ -1752,7 +1996,19 @@ def assemble_film(p: Project, ev: threading.Event) -> None:
             if amb:
                 fx_tr.add_loop(audio.decode(amb), S, end, 0.55, fade=0.8, offset=S)
         if s.get("sfx_on", True) and sc.sfx and sc.sfx != "none":
-            fxp = audio.sfx(sc.sfx)
+            fxp = None
+            if s.get("local_foley", False):
+                try:
+                    fxp = audio.generate_mmaudio(
+                        f"Sound effect: {sc.sfx}. Scene: {sc.video_prompt or sc.title}.",
+                        min(12.0, max(1.0, durs[i])),
+                        p.scene_dir(sc.id) / f"mmaudio_{sc.sfx}.wav",
+                        seed=int(p.state(sc.id).get("seed") or i + 1),
+                    )
+                except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
+                    p.log(f"⚠️ Local MMAudio unavailable for scene {i + 1}; using the built-in SFX: {exc}")
+            if fxp is None:
+                fxp = audio.sfx(sc.sfx)
             if fxp:
                 sig = audio.decode(fxp)
                 effect_duration = sig.shape[0] / audio.SR
@@ -1772,10 +2028,31 @@ def assemble_film(p: Project, ev: threading.Event) -> None:
     voice_wav = voice_tr.write(work / "voice.wav")
     if not has_voice:
         voice_wav = None
+    mood = s.get("music_mood") if s.get("music_mood") not in ("auto", "", None) else plan.music_mood
+    music_wav = None
+    user_music = Path(s["music_path"]) if s.get("music_path") and Path(s["music_path"]).exists() else None
+    if mood != "none" or user_music:
+        music_mood = mood if mood != "none" else "ambient"
+        music_seed = _music_seed(p.id, int(s.get("music_variation", 0)))
+        if user_music:
+            music_wav = audio.build_music(work / "music.wav", total, music_mood, cues,
+                                          seed=music_seed, user_music=user_music)
+        elif s.get("local_music_generator") == "acestep":
+            try:
+                music_wav = audio.generate_ace_music(
+                    work / "music.wav", total, music_mood,
+                    prompt=f"Instrumental {music_mood} score for {plan.title}: {plan.logline}",
+                    seed=music_seed,
+                )
+            except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
+                p.log(f"⚠️ ACE-Step unavailable; using the built-in score: {exc}")
+                music_wav = audio.build_music(work / "music.wav", total, music_mood, cues, seed=music_seed)
+        else:
+            music_wav = audio.build_music(work / "music.wav", total, music_mood, cues, seed=music_seed)
     aligned_words = []
     if voice_wav:
         language = {"English": "en", "Hindi": "hi"}.get(s.get("language", "English"))
-        alignment_source = Path(external_voiceover) if external_voiceover else voice_wav
+        alignment_source = external_audio if external_audio else voice_wav
         aligned_words = alignment.align_project_audio(
             alignment_source, p.dir, language=language, log=p.log,
             model_size=str(s.get("alignment_model", "tiny")),
@@ -1787,6 +2064,11 @@ def assemble_film(p: Project, ev: threading.Event) -> None:
             all_chunks = render.chunk_words(aligned_captions, int(s.get("caption_words") or 4))
             scene_runtime = render.total_length(durs[:n], tdur[:max(0, n - 1)])
             visual_beats = alignment.visual_beat_intervals(aligned_words, scene_runtime)
+            beat_times = []
+            if s.get("beat_sync_cuts", False) and music_wav:
+                beat_times = audio.detect_beats(music_wav, work / "beats.json")
+                visual_beats = audio.snap_beats_to_music(visual_beats, beat_times, tolerance=0.35)
+                p.data["beat_times"] = beat_times
             source_hash = alignment.audio_sha256(alignment_source)
             aligned = [
                 {"start": beat["start"], "end": beat["end"],
@@ -1843,14 +2125,9 @@ def assemble_film(p: Project, ev: threading.Event) -> None:
             clips, durs, trans = expanded_clips, expanded_durs, expanded_trans
             p.save(force=False)
     fx_wav = fx_tr.write(work / "fx.wav")
-    mood = s.get("music_mood") if s.get("music_mood") not in ("auto", "", None) else plan.music_mood
-    music_wav = None
-    user_music = Path(s["music_path"]) if s.get("music_path") and Path(s["music_path"]).exists() else None
-    if mood != "none" or user_music:
-        music_wav = audio.build_music(work / "music.wav", total, mood if mood != "none" else "ambient", cues,
-                                      seed=_music_seed(p.id, int(s.get("music_variation", 0))),
-                                      user_music=user_music)
-    mix = audio.mix_final(voice_wav, music_wav, fx_wav, work / "mix.m4a", total, voice_vol=float(s["voice_vol"]),
+    master_mix = out_dir / "master_mix.wav"
+    mix = audio.mix_final(voice_wav, music_wav, fx_wav, work / "mix.m4a", total,
+                          stem_dir=out_dir, master_out=master_mix, voice_vol=float(s["voice_vol"]),
                           music_vol=float(s["music_vol"]), fx_vol=float(s["fx_vol"]), duck=float(s["duck"]),
                           loudness=float(s["loudness"]), duck_db=float(s.get("duck_db", -24.0)))
     if s.get("strict_loudness_gate", True):
@@ -1866,6 +2143,9 @@ def assemble_film(p: Project, ev: threading.Event) -> None:
 
     stage("📦 Final encode and export", 0.95)
     ext, codec = cinema.FORMATS.get(s["format"], ("mp4", "libx264"))
+    if s.get("encoding_mode", "auto") != "cpu" and codec in ("libx264", "libx265"):
+        codec = (render.detect_video_encoder("hevc") if codec == "libx265" else
+                 render.detect_video_encoder())["recommended"]
     q = cinema.QUALITY.get(s["quality"], cinema.QUALITY["High"])
     _, _, (FW, FH) = render_size(s)
     slug = re.sub(r"[^A-Za-z0-9]+", "_", plan.title or "film").strip("_")[:40] or "film"
@@ -1875,7 +2155,18 @@ def assemble_film(p: Project, ev: threading.Event) -> None:
         kinetic_ass = render.write_kinetic_ass(aligned_words, out_dir / f"{slug}.ass", FW, FH,
                                                str(s.get("caption_color", "#22D3EE")),
                                                str(s.get("caption_preset", "Hormozi Bounce")))
-    render.export_final(silent, mix, final, FW, FH, int(s["fps"]), codec, q["crf"], q["preset"],
+    export_video, postprocess = render.vulkan_video_postprocess(
+        silent, work / "vulkan_cache", int(s["fps"]),
+        upscale=bool(s.get("vulkan_upscale", False)),
+        interpolation=str(s.get("frame_interpolation", "none")),
+        should_cancel=ev.is_set,
+    )
+    for warning in postprocess.get("warnings", []):
+        p.log(f"⚠️ {warning}")
+    export_fps = int(s["fps"])
+    if postprocess.get("applied") and s.get("frame_interpolation") in ("rife-2x", "rife-4x"):
+        export_fps = min(60, export_fps * (2 if s["frame_interpolation"] == "rife-2x" else 4))
+    render.export_final(export_video, mix, final, FW, FH, export_fps, codec, q["crf"], q["preset"],
                         float(s["fade_in"]), float(s["fade_out"]), total, subtitle_ass=kinetic_ass)
     render_qa = quality.inspect_render(final)
     subtitle_qa = quality.inspect_subtitle_drift(aligned_words, all_chunks, total)
@@ -1978,8 +2269,37 @@ def assemble_film(p: Project, ev: threading.Event) -> None:
     meta.write_text(f"TITLE: {plan.youtube_title or plan.title}\n\nDESCRIPTION:\n{desc}\n\n"
                     f"TAGS: {', '.join(plan.tags)}\n\nPINNED COMMENT:\n{pinned_comment}\n",
                     encoding="utf-8")
+    otio_scenes = [{
+        "id": scene.id,
+        "title": scene.title,
+        "chapter": scene.chapter,
+        "clip": str(clips[index]),
+    } for index, scene in enumerate(scenes)]
+    otio_overlays = [{
+        "text": scene.overlay_text if (index > 0 or s.get("title_card", True)) else "",
+        "kind": scene.overlay_kind,
+    } for index, scene in enumerate(scenes)]
+    if len(clips) > n:
+        otio_scenes.append({"id": "end-card", "title": "End Card", "chapter": "", "clip": str(clips[n])})
+        otio_overlays.append({})
+    otio_path = otio_export.write_timeline(
+        out_dir / f"{slug}.otio",
+        name=plan.title or slug,
+        scenes=otio_scenes,
+        durations=durs,
+        transitions=trans,
+        fps=float(s["fps"]),
+        narration=out_dir / "narration_stem.wav",
+        music_sfx=out_dir / "music_sfx_stem.wav",
+        overlays=otio_overlays,
+        beat_times=p.data.get("beat_times", []),
+    )
     with p.lock:
         p.data["outputs"] = {"video": str(final), "srt": str(srt), "vtt": str(vtt),
+                             "narration_stem": str(out_dir / "narration_stem.wav"),
+                             "music_sfx_stem": str(out_dir / "music_sfx_stem.wav"),
+                             "master_mix": str(master_mix),
+                             "otio": str(otio_path),
                              "ass": str(kinetic_ass) if kinetic_ass else "",
                              "alignment": str(p.dir / "alignment.json") if aligned_words else "",
                              "thumbnail": str(thumb), "metadata": str(meta),
@@ -2133,14 +2453,25 @@ def package_zip(p: Project) -> Path:
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
         outs = p.data.get("outputs") or {}
         files = [outs.get(k) for k in ("video", "short", "srt", "vtt", "ass", "alignment",
-                                       "thumbnail", "metadata")]
+                                       "thumbnail", "metadata", "otio", "narration_stem",
+                                       "music_sfx_stem", "master_mix")]
         files += list(outs.get("thumbnails") or [])
         files += list(outs.get("thumbnails_png") or [])
+        files += list(outs.get("thumbnail_lab") or [])
         files += list(outs.get("autoclips") or [])
         files.append(p.settings.get("external_voiceover_path", ""))
+        files.append(p.settings.get("lut_path", ""))
+        files.append(p.dir / "work" / "endcard.mp4")
         for f in dict.fromkeys(f for f in files if f):
             if Path(f).exists():
                 z.write(f, f"final/{Path(f).name}")
+        for language_pack in (outs.get("dubs") or {}).values():
+            if not isinstance(language_pack, dict):
+                continue
+            for key in ("audio", "srt", "manifest"):
+                path = language_pack.get(key)
+                if path and Path(path).is_file():
+                    z.write(path, f"final/dubs/{Path(path).name}")
         z.writestr("plan.json", json.dumps(p.data.get("plan"), indent=2))
         bible = ensure_visual_bible(p)
         z.writestr("visualBible.json", json.dumps(bible, indent=2))
@@ -2152,6 +2483,13 @@ def package_zip(p: Project) -> Path:
         if plan:
             for i, sc in enumerate(plan.scenes, 1):
                 st = p.state(sc.id)
+                clip_path = st.get("clip")
+                if clip_path and Path(clip_path).is_file():
+                    try:
+                        arcname = Path(clip_path).resolve().relative_to(p.dir.resolve()).as_posix()
+                    except ValueError:
+                        arcname = f"scenes/{i:02d}_clip{Path(clip_path).suffix}"
+                    z.write(clip_path, arcname)
                 for key in ("image", "stock", "ai_video"):
                     f = st.get(key)
                     if f and Path(f).exists():
@@ -2159,6 +2497,16 @@ def package_zip(p: Project) -> Path:
                 for j, part in enumerate(st.get("voice_parts", [])):
                     if Path(part["path"]).exists():
                         z.write(part["path"], f"scenes/{i:02d}_voice_{j}{Path(part['path']).suffix}")
+        model_root = p.dir / "remotion_public" / "models"
+        if model_root.is_dir():
+            for model_file in model_root.rglob("*"):
+                if model_file.is_file():
+                    z.write(model_file, f"models/{model_file.relative_to(model_root).as_posix()}")
+        hero_root = p.dir / "hero_clips"
+        if hero_root.is_dir():
+            for hero_file in hero_root.rglob("*"):
+                if hero_file.is_file():
+                    z.write(hero_file, f"hero_clips/{hero_file.relative_to(hero_root).as_posix()}")
         for short_path in outs.get("autoclips") or []:
             if Path(short_path).is_file():
                 z.write(short_path, f"shorts/{Path(short_path).name}")

@@ -2,7 +2,10 @@
 ambience beds and sound effects, timeline track building, and the final mix (voice-ducked music, ambience,
 SFX, EBU R128 loudness normalisation). Everything is generated locally - no stock music API exists for the
 configured providers, so the score is honestly labelled as a generated score."""
+import hashlib
+import json
 import math
+import re
 import subprocess
 import wave
 from pathlib import Path
@@ -10,6 +13,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from . import local_ai
 from .config import CACHE_DIR
 
 SR = 44100
@@ -41,6 +45,14 @@ CUE_LEVELS = {"calm": (0.75, 0.0), "build": (0.9, 0.55), "climax": (1.0, 1.0), "
 
 def _midi_hz(semi_from_a4: float) -> float:
     return 440.0 * 2 ** (semi_from_a4 / 12.0)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _chord(root_semi: int, quality: str) -> List[int]:
@@ -418,6 +430,27 @@ def _write_pcm_wav(path: Path, data: np.ndarray) -> None:
         output.writeframes(pcm.tobytes())
 
 
+def _write_cached_wav(path: Path, data: np.ndarray, signature: str = "") -> None:
+    samples = np.ascontiguousarray(np.asarray(data, dtype=np.float32))
+    digest = hashlib.sha256(f"{SR}:{signature}:{samples.shape}".encode("ascii"))
+    digest.update(memoryview(samples).cast("B"))
+    key = digest.hexdigest()
+    sidecar = path.with_suffix(path.suffix + ".sha256")
+    if path.is_file() and sidecar.is_file():
+        try:
+            if sidecar.read_text(encoding="ascii").strip() == key:
+                return
+        except OSError:
+            pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.stem + ".tmp.wav")
+    _write_pcm_wav(temporary, samples)
+    temporary.replace(path)
+    side_tmp = sidecar.with_suffix(sidecar.suffix + ".tmp")
+    side_tmp.write_text(key, encoding="ascii")
+    side_tmp.replace(sidecar)
+
+
 def _rms_db(data: np.ndarray, eps: float = 1e-9) -> float:
     rms = float(np.sqrt(np.mean(np.asarray(data, dtype=np.float32) ** 2) + eps))
     return 20.0 * math.log10(max(rms, eps))
@@ -485,7 +518,7 @@ def apply_speech_ducking(music: np.ndarray, voice: np.ndarray, target_db: float 
 
 
 class Track:
-    """Disk-backed stereo timeline (keeps RAM flat for long 50-scene films)."""
+    """Disk-backed stereo timeline (keeps RAM flat for long-form films)."""
 
     def __init__(self, path: Path, seconds: float):
         self.path = path
@@ -556,10 +589,280 @@ def build_music(out: Path, total: float, mood: str, cues: List[Tuple[float, floa
     return tr.write(out)
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def generate_ace_music(out: Path, total: float, mood: str, prompt: str = "", seed: int = 1) -> Path:
+    """Uses the explicitly configured loopback ACE-Step REST service and content-addresses its result."""
+    if float(total) <= 0:
+        raise ValueError("ACE-Step music duration must be positive.")
+    generation_duration = max(10.0, min(600.0, float(total)))
+    style = prompt.strip() or f"Instrumental {mood} documentary score, no vocals, no speech"
+    key = hashlib.sha256(
+        f"ace-step-v1:{round(total, 2)}:{generation_duration:.2f}:{mood}:{style}:{int(seed)}".encode("utf-8")
+    ).hexdigest()
+    cached = CACHE_DIR / "ace_step" / f"{key}.wav"
+    if not cached.is_file():
+        raw = cached.with_name(cached.stem + ".source.bin")
+        generated = cached.with_name(cached.stem + ".generated.wav")
+        try:
+            local_ai.generate_audio(
+                "acestep",
+                {"prompt": style, "duration_seconds": int(round(generation_duration)), "instrumental": True,
+                 "seed": int(seed), "model": "ACE-Step 1.5"},
+                raw, timeout=max(180, min(900, total * 2)),
+            )
+            local_ai.normalize_audio(raw, generated)
+            samples = decode(generated)
+            if samples.shape[0] < SR:
+                raise RuntimeError("ACE-Step returned less than one second of audio.")
+            track = Track(cached, total)
+            track.add_loop(samples, 0.0, total, 1.0, fade=1.0)
+            track.write(cached)
+        finally:
+            raw.unlink(missing_ok=True)
+            generated.unlink(missing_ok=True)
+    return cached
+
+
+def generate_mmaudio(prompt: str, duration: float, out: Path, seed: int = 1) -> Path:
+    """Generates optional short foley from an explicitly configured local MMAudio endpoint."""
+    if not prompt.strip():
+        raise ValueError("MMAudio foley prompt must not be empty.")
+    seconds = max(1.0, min(20.0, float(duration)))
+    key = hashlib.sha256(
+        f"mmaudio-v1:{prompt.strip()}:{seconds:.2f}:{int(seed)}".encode("utf-8")
+    ).hexdigest()
+    cached = CACHE_DIR / "mmaudio" / f"{key}.wav"
+    if not cached.is_file():
+        raw = cached.with_name(cached.stem + ".source.bin")
+        try:
+            local_ai.generate_audio(
+                "mmaudio", {"prompt": prompt.strip(), "duration_seconds": seconds, "seed": int(seed)},
+                raw, timeout=300,
+            )
+            local_ai.normalize_audio(raw, cached)
+        finally:
+            raw.unlink(missing_ok=True)
+    if Path(out) != cached:
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
+        temporary = Path(out).with_name(Path(out).name + ".tmp")
+        temporary.write_bytes(cached.read_bytes())
+        temporary.replace(out)
+        return Path(out)
+    return cached
+
+
+def trim_silence(path: Path, cache_dir: Path, silence_threshold_db: float = -42.0,
+                 min_silence_seconds: float = 0.65, keep_silence_seconds: float = 0.28) -> Path:
+    """Content-cache a lossless trim that shortens only long silent gaps."""
+    path, cache_dir = Path(path), Path(cache_dir)
+    if not path.is_file():
+        raise FileNotFoundError(f"Audio file not found: {path}")
+    digest = hashlib.sha256(
+        f"silence-v1:{silence_threshold_db}:{min_silence_seconds}:{keep_silence_seconds}:".encode("ascii")
+    )
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    signature = digest.hexdigest()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    output = cache_dir / f"trimmed_{signature[:20]}.wav"
+    if output.is_file() and output.stat().st_size:
+        return output
+    temporary = output.with_name(output.stem + ".part.wav")
+    detect = subprocess.run(
+        ["ffmpeg", "-nostats", "-hide_banner", "-v", "info", "-i", str(path),
+         "-af", f"silencedetect=noise={silence_threshold_db:.1f}dB:d={min_silence_seconds:.3f}",
+         "-f", "null", "-"],
+        capture_output=True, text=True, timeout=600,
+    )
+    if detect.returncode:
+        raise RuntimeError(f"Silence detection failed: {detect.stderr[-400:]}")
+    duration_probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+        capture_output=True, text=True, timeout=30,
+    )
+    try:
+        duration = float(duration_probe.stdout.strip())
+    except ValueError as exc:
+        raise RuntimeError(f"Could not read the voiceover duration: {duration_probe.stderr[-300:]}") from exc
+    silences = []
+    pending_start = None
+    for line in detect.stderr.splitlines():
+        start_match = re.search(r"silence_start:\s*(-?\d+(?:\.\d+)?)", line)
+        end_match = re.search(r"silence_end:\s*(-?\d+(?:\.\d+)?)", line)
+        if start_match:
+            pending_start = max(0.0, float(start_match.group(1)))
+        if end_match and pending_start is not None:
+            silences.append((pending_start, min(duration, float(end_match.group(1)))))
+            pending_start = None
+    if pending_start is not None:
+        silences.append((pending_start, duration))
+
+    cuts = [
+        (start + keep_silence_seconds, end)
+        for start, end in silences
+        if end - start >= min_silence_seconds and end - start > keep_silence_seconds
+    ]
+    spans = []
+    cursor = 0.0
+    for start, end in cuts:
+        start, end = max(cursor, start), min(duration, end)
+        if start > cursor + 0.01:
+            spans.append((cursor, start))
+        cursor = max(cursor, end)
+    if duration > cursor + 0.01:
+        spans.append((cursor, duration))
+    if not spans:
+        raise RuntimeError("Silence trimming removed the entire voiceover; check the input and threshold.")
+    if len(spans) == 1 and spans[0] == (0.0, duration):
+        filter_args = ["-i", str(path), "-vn", "-ar", str(SR), "-ac", "2",
+                       "-c:a", "pcm_s16le", str(temporary)]
+    else:
+        graph = ";".join(
+            f"[0:a]atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS[a{index}]"
+            for index, (start, end) in enumerate(spans)
+        )
+        graph += f";{''.join(f'[a{index}]' for index in range(len(spans)))}"
+        graph += f"concat=n={len(spans)}:v=0:a=1[outa]"
+        filter_args = ["-i", str(path), "-filter_complex", graph, "-map", "[outa]", "-vn",
+                       "-ar", str(SR), "-ac", "2", "-c:a", "pcm_s16le", str(temporary)]
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-v", "error", *filter_args],
+        capture_output=True, text=True, timeout=600,
+    )
+    if result.returncode or not temporary.is_file() or temporary.stat().st_size == 0:
+        temporary.unlink(missing_ok=True)
+        raise RuntimeError(f"Silence trimming failed: {result.stderr[-400:]}")
+    temporary.replace(output)
+    return output
+
+
+def detect_beats(path: Path, cache_path: Path) -> List[float]:
+    """Detect beat times via librosa when installed, otherwise use a NumPy onset-envelope fallback."""
+    path, cache_path = Path(path), Path(cache_path)
+    source_hash = _file_sha256(path)
+    if cache_path.is_file():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if cached.get("source_sha256") == source_hash and isinstance(cached.get("beats"), list):
+                return [float(value) for value in cached["beats"]]
+        except (OSError, ValueError, TypeError):
+            pass
+
+    method = "numpy_onset"
+    beats: List[float] = []
+    try:
+        import librosa
+        samples, sample_rate = librosa.load(str(path), sr=22050, mono=True)
+        _, beat_frames = librosa.beat.beat_track(y=samples, sr=sample_rate, units="frames")
+        beats = [float(value) for value in librosa.frames_to_time(beat_frames, sr=sample_rate)]
+        method = "librosa"
+    except (ImportError, OSError, ValueError, RuntimeError, AttributeError):
+        samples = decode(path).mean(axis=1)
+        hop = max(1, int(SR * 0.01))
+        frames = samples[:len(samples) // hop * hop].reshape(-1, hop)
+        if len(frames) > 2:
+            envelope = np.sqrt(np.mean(frames * frames, axis=1))
+            onset = np.maximum(0.0, np.diff(envelope, prepend=envelope[0]))
+            median = float(np.median(onset))
+            spread = float(np.median(np.abs(onset - median)))
+            threshold = median + max(1e-5, spread * 2.5)
+            candidates = np.flatnonzero(
+                (onset[1:-1] >= onset[:-2]) & (onset[1:-1] > onset[2:])
+                & (onset[1:-1] > threshold)
+            ) + 1
+            last = -int(0.25 / 0.01)
+            for index in candidates:
+                if index - last >= 25:
+                    beats.append(float(index * 0.01))
+                    last = int(index)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    temporary.write_text(json.dumps({"source_sha256": source_hash, "method": method, "beats": beats}),
+                         encoding="utf-8")
+    temporary.replace(cache_path)
+    return beats
+
+
+def waveform_envelope(path: Path, cache_path: Path, buckets: int = 900) -> List[float]:
+    """Read a WAV in bounded chunks and cache a normalized RMS envelope for timeline display."""
+    path, cache_path = Path(path), Path(cache_path)
+    source_hash = _file_sha256(path)
+    if cache_path.is_file():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if (cached.get("source_sha256") == source_hash and cached.get("buckets") == int(buckets)
+                    and isinstance(cached.get("values"), list)):
+                return [float(value) for value in cached["values"]]
+        except (OSError, ValueError, TypeError):
+            pass
+    with wave.open(str(path), "rb") as source:
+        channels = source.getnchannels()
+        width = source.getsampwidth()
+        total_frames = source.getnframes()
+        bucket_frames = max(1, int(math.ceil(total_frames / max(1, buckets))))
+        dtype = {1: np.uint8, 2: np.dtype("<i2"), 4: np.dtype("<i4")}.get(width)
+        if dtype is None:
+            raise ValueError(f"Unsupported WAV sample width for waveform: {width}")
+        values = []
+        for _ in range((total_frames + bucket_frames - 1) // bucket_frames):
+            raw = source.readframes(bucket_frames)
+            samples = np.frombuffer(raw, dtype=dtype).astype(np.float32)
+            if width == 1:
+                samples = (samples - 128.0) / 128.0
+            else:
+                samples /= float(2 ** (width * 8 - 1))
+            if channels > 1:
+                samples = samples[:len(samples) // channels * channels].reshape(-1, channels).mean(axis=1)
+            values.append(float(np.sqrt(np.mean(samples * samples))) if len(samples) else 0.0)
+    peak = max(values, default=0.0)
+    normalized = [round(value / peak, 4) if peak > 0 else 0.0 for value in values]
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    temporary.write_text(json.dumps({"source_sha256": source_hash, "buckets": int(buckets),
+                                     "values": normalized}),
+                         encoding="utf-8")
+    temporary.replace(cache_path)
+    return normalized
+
+
+def snap_beats_to_music(visual_beats: Sequence[dict], beat_times: Sequence[float],
+                        tolerance: float = 0.35, min_interval: float = 0.5) -> List[dict]:
+    """Move internal visual cut boundaries to nearby music beats without collapsing intervals."""
+    result = [dict(item) for item in visual_beats]
+    if len(result) < 2 or not beat_times:
+        return result
+    times = sorted(float(value) for value in beat_times)
+    boundaries = [float(item["end"]) for item in result[:-1]]
+    for index, boundary in enumerate(boundaries):
+        candidates = [beat for beat in times if abs(beat - boundary) <= tolerance]
+        if not candidates:
+            continue
+        lower = float(result[index]["start"]) + min_interval
+        upper = float(result[index + 1]["end"]) - min_interval
+        if index:
+            lower = max(lower, float(result[index - 1]["end"]) + min_interval)
+        nearest = min(candidates, key=lambda beat: abs(beat - boundary))
+        if lower <= nearest <= upper:
+            result[index]["end"] = nearest
+            result[index + 1]["start"] = nearest
+    return result
+
+
 def mix_final(voice: Optional[Path], music: Optional[Path], fx: Optional[Path], out: Path, total: float,
               voice_vol: float = 1.0, music_vol: float = 0.35, fx_vol: float = 0.5, duck: float = 0.6,
-              loudness: float = -14.0, duck_db: Optional[float] = None) -> Path:
+              loudness: float = -14.0, duck_db: Optional[float] = None,
+              stem_dir: Optional[Path] = None, master_out: Optional[Path] = None) -> Path:
     """Mix stems with deterministic speech-envelope ducking and EBU R128 mastering."""
+    out.parent.mkdir(parents=True, exist_ok=True)
     voice_audio = decode(voice) * float(voice_vol) if voice else None
     music_audio = decode(music) * float(music_vol) if music else None
     fx_audio = decode(fx) * float(fx_vol) if fx else None
@@ -580,12 +883,28 @@ def mix_final(voice: Optional[Path], music: Optional[Path], fx: Optional[Path], 
             raise RuntimeError(f"voice cleanup failed: {cleaned.stderr[-400:]}")
         voice_clean_path = out.with_suffix(".voice.wav")
         voice_audio = decode(voice_clean_path)
+        voice_clean_path.unlink(missing_ok=True)
 
     if music_audio is not None and voice_audio is not None:
         target_db = -24.0 if duck_db is None else float(duck_db)
         if duck_db is None:
             target_db = float(np.clip(-22.0 - 4.0 * float(duck), -26.0, -22.0))
         music_audio = apply_speech_ducking(music_audio, voice_audio, target_db=target_db)
+
+    length = max(1, int(total * SR))
+    if stem_dir is not None:
+        stem_dir = Path(stem_dir)
+        narration = np.zeros((length, 2), dtype=np.float32)
+        if voice_audio is not None:
+            n = min(length, voice_audio.shape[0])
+            narration[:n] = voice_audio[:n]
+        _write_cached_wav(stem_dir / "narration_stem.wav", narration, "narration-v1")
+        music_sfx = np.zeros((length, 2), dtype=np.float32)
+        for stem in (music_audio, fx_audio):
+            if stem is not None:
+                n = min(length, stem.shape[0])
+                music_sfx[:n] += stem[:n].astype(np.float32)
+        _write_cached_wav(stem_dir / "music_sfx_stem.wav", music_sfx, "music-sfx-v1")
 
     stems = [stem for stem in (voice_audio, music_audio, fx_audio) if stem is not None]
     if not stems:
@@ -596,10 +915,33 @@ def mix_final(voice: Optional[Path], music: Optional[Path], fx: Optional[Path], 
         mixed[:n] += stem[:n].astype(np.float32)
     premix = out.with_suffix(".premix.wav")
     _write_pcm_wav(premix, mixed)
-    cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(premix),
-           "-af", f"loudnorm=I={loudness}:TP=-1.5:LRA=11,alimiter=limit=0.95,atrim=0:{total:.3f}",
-           "-ar", str(SR), "-ac", "2", str(out)]
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    if res.returncode != 0:
-        raise RuntimeError(f"audio mix failed: {res.stderr[-400:]}")
+    def encode_mix(target: Path, target_loudness: float) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        cache_digest = hashlib.sha256(
+            f"{SR}:{total:.6f}:{target_loudness:.3f}:master-v2".encode("ascii")
+        )
+        cache_digest.update(memoryview(mixed).cast("B"))
+        cache_key = cache_digest.hexdigest()
+        cache_sidecar = target.with_suffix(target.suffix + ".sha256")
+        if target.is_file() and cache_sidecar.is_file():
+            try:
+                if cache_sidecar.read_text(encoding="ascii").strip() == cache_key:
+                    return
+            except OSError:
+                pass
+        cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(premix),
+               "-af", f"loudnorm=I={target_loudness}:TP=-1.5:LRA=11,"
+                     f"alimiter=limit=0.84:level=false,atrim=0:{total:.3f}",
+               "-ar", str(SR), "-ac", "2", str(target)]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            raise RuntimeError(f"audio mix failed: {res.stderr[-400:]}")
+        cache_tmp = cache_sidecar.with_suffix(cache_sidecar.suffix + ".tmp")
+        cache_tmp.write_text(cache_key, encoding="ascii")
+        cache_tmp.replace(cache_sidecar)
+
+    if master_out is not None and Path(master_out) != out:
+        encode_mix(Path(master_out), -14.0)
+    encode_mix(out, loudness)
+    premix.unlink(missing_ok=True)
     return out

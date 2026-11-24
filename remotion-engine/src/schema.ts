@@ -19,6 +19,21 @@ const MetricSchema = z.object({
   value: z.union([z.string().max(80), z.number().finite()]),
 }).strict();
 
+const MapCitySchema = z.object({
+  name: z.string().min(1).max(60),
+  longitude: z.number().finite().min(-180).max(180),
+  latitude: z.number().finite().min(-90).max(90),
+}).strict();
+const MapRouteSchema = z.object({
+  from: z.string().min(1).max(60),
+  to: z.string().min(1).max(60),
+  label: z.string().max(80),
+}).strict();
+const MapCenterSchema = z.object({
+  longitude: z.number().finite().min(-180).max(180),
+  latitude: z.number().finite().min(-90).max(90),
+}).strict();
+
 export const ProceduralPropsSchema = z.discriminatedUnion('template', [
   z.object({
     ...Common,
@@ -84,6 +99,21 @@ export const ProceduralPropsSchema = z.discriminatedUnion('template', [
     hookText: z.string().min(1).max(160),
     kicker: z.string().max(80),
   }).strict(),
+  z.object({
+    ...Common,
+    template: z.literal('map_route_animator'),
+    cities: z.array(MapCitySchema).min(2).max(12),
+    routes: z.array(MapRouteSchema).min(1).max(12),
+    highlightCountries: z.array(z.string().regex(/^\d{1,3}$/)).max(20),
+    mapCenter: MapCenterSchema,
+    zoom: z.number().finite().min(1).max(4),
+  }).strict(),
+  z.object({
+    ...Common,
+    template: z.literal('3d_model_showcase'),
+    modelUrl: z.string().max(240),
+    calloutTitle: z.string().min(1).max(120),
+  }).strict(),
 ]);
 
 export type ProceduralProps = z.infer<typeof ProceduralPropsSchema>;
@@ -93,6 +123,7 @@ export const CompositionPropsSchema = z.object({
   template: z.enum([
     '3d_bar_chart', '3d_stat_callout', 'comparison_split', 'timeline_journey',
     'process_flow', 'quote_evidence_card', '2d_character_explainer', 'kinetic_hook_title',
+    'map_route_animator', '3d_model_showcase',
   ]),
   subtitle: z.string().max(200).optional(),
   unit: z.string().max(20).optional(),
@@ -125,6 +156,13 @@ export const CompositionPropsSchema = z.object({
   }).strict()).max(200).optional(),
   hookText: z.string().min(1).max(160).optional(),
   kicker: z.string().max(80).optional(),
+  cities: z.array(MapCitySchema).min(2).max(12).optional(),
+  routes: z.array(MapRouteSchema).min(1).max(12).optional(),
+  highlightCountries: z.array(z.string().regex(/^\d{1,3}$/)).max(20).optional(),
+  mapCenter: MapCenterSchema.optional(),
+  zoom: z.number().finite().min(1).max(4).optional(),
+  modelUrl: z.string().max(240).optional(),
+  calloutTitle: z.string().min(1).max(120).optional(),
 }).strict();
 
 export type CompositionProps = z.infer<typeof CompositionPropsSchema>;
@@ -152,6 +190,17 @@ const templateDefaults: Record<ProceduralProps['template'], Record<string, unkno
     mouthStateTimeline: [],
   },
   kinetic_hook_title: {hookText: 'The hidden truth', kicker: 'WATCH THIS'},
+  map_route_animator: {
+    cities: [
+      {name: 'Origin', longitude: -73.9, latitude: 40.7},
+      {name: 'Destination', longitude: 2.3, latitude: 48.9},
+    ],
+    routes: [{from: 'Origin', to: 'Destination', label: ''}],
+    highlightCountries: [],
+    mapCenter: {longitude: 0, latitude: 20},
+    zoom: 1,
+  },
+  '3d_model_showcase': {modelUrl: '', calloutTitle: 'Featured model'},
 };
 
 export const resolveProceduralProps = (props: CompositionProps): ProceduralProps => {

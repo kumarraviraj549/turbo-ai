@@ -18,7 +18,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from . import cache, config
+from . import cache, config, local_ai
 from .http import ProviderError, breaker_reason, limiter, request, trip_breaker
 
 # name -> (edge voice id, description)
@@ -71,6 +71,9 @@ TTS_ENGINES = {
     "cf_aura2": "Cloudflare Deepgram Aura-2 (premium, ~2.7k neurons per 1k chars)",
     "groq_orpheus": "Groq Orpheus (free-tier English, rate-limited; Kokoro fallback)",
     "sarvam": "Sarvam Bulbul v4 Flash (Hindi / Hinglish, API key required)",
+    "chatterbox": "Chatterbox (optional local, reference-voice consent required)",
+    "qwen3_tts": "Qwen3-TTS (optional local)",
+    "dia": "Dia (optional local dialogue / banter)",
 }
 KOKORO_VOICES = [
     ("af_bella", "Bella (American English, F)"),
@@ -124,6 +127,8 @@ class SpeechChunk:
 
 
 def voice_options(language: str, engine: str = "edge") -> List[Tuple[str, str]]:
+    if engine in ("chatterbox", "qwen3_tts", "dia"):
+        return [("default", "Local model default voice")]
     if engine == "kokoro":
         return KOKORO_VOICES if language == "English" else []
     if engine == "groq_orpheus":
@@ -591,6 +596,8 @@ def synthesize(
     log: Optional[Callable[[str], None]] = None,
     language: str = "English",
     allow_edge_draft: bool = False,
+    voice_reference_path: Optional[Path] = None,
+    voice_clone_consent: bool = False,
 ) -> TTSResult:
     """Synthesizes speech with word timings; production engines preserve chunk-level resume caches."""
     text = re.sub(r"[ \t]+", " ", (text or "").strip())
@@ -602,6 +609,52 @@ def synthesize(
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     warnings: List[str] = []
+
+    if engine in ("chatterbox", "qwen3_tts", "dia"):
+        if engine == "chatterbox" and not voice_clone_consent:
+            raise TTSError("Chatterbox voice cloning requires explicit consent for the reference voice.")
+        reference = None
+        if engine == "chatterbox":
+            if not voice_reference_path or not Path(voice_reference_path).is_file():
+                raise TTSError("Chatterbox requires a reference WAV stored in this project.")
+            reference = Path(voice_reference_path)
+            if reference.stat().st_size > 25 * 1024 * 1024:
+                raise TTSError("Chatterbox reference WAV must be 25 MiB or smaller.")
+        service = {"chatterbox": "chatterbox", "qwen3_tts": "qwen3_tts", "dia": "dia"}[engine]
+        payload = {
+            "text": text, "language": language, "voice": voice or "default",
+            "speed": max(0.7, min(1.4, float(speed))), "pitch_hz": int(pitch_hz),
+            "emotion": emotion,
+        }
+        if reference is not None:
+            payload["reference_audio_base64"] = base64.b64encode(reference.read_bytes()).decode("ascii")
+        try:
+            raw_path = out_path.with_name(out_path.stem + ".local-source.bin")
+            local_ai.generate_audio(service, payload, raw_path, timeout=600)
+            result_path = local_ai.normalize_audio(raw_path, out_path.with_suffix(".wav"))
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+            raise TTSError(f"{TTS_ENGINES[engine]} failed: {exc}") from exc
+        finally:
+            raw_path = out_path.with_name(out_path.stem + ".local-source.bin")
+            raw_path.unlink(missing_ok=True)
+        duration = probe_duration(result_path)
+        if duration <= 0.1:
+            raise TTSError(f"{TTS_ENGINES[engine]} returned unreadable audio.")
+        if abs(speed - 1.0) > 0.02:
+            adjusted = result_path.with_name(result_path.stem + ".speed.wav")
+            tempo = max(0.7, min(1.4, float(speed)))
+            completed = subprocess.run(
+                ["ffmpeg", "-y", "-v", "error", "-i", str(result_path), "-af", f"atempo={tempo:.3f}",
+                 "-ar", "24000", "-ac", "1", str(adjusted)],
+                capture_output=True, text=True, timeout=180, check=False,
+            )
+            if completed.returncode or not adjusted.is_file() or adjusted.stat().st_size < 100:
+                adjusted.unlink(missing_ok=True)
+                raise TTSError(f"Could not adjust local TTS speed: {completed.stderr[-250:]}")
+            adjusted.replace(result_path)
+            duration = probe_duration(result_path)
+        return TTSResult(result_path, duration, engine, voice or "default",
+                         _estimate_words(text, duration), warnings)
 
     if engine in ("kokoro", "sarvam", "groq_orpheus"):
         if engine == "kokoro" and language != "English":

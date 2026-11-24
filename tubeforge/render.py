@@ -6,6 +6,7 @@ Stage 2 (FFmpeg filter graph): colour grade, bloom, depth of field, chromatic ab
 letterbox, text overlays and word-timed captions. Scenes are joined with xfade transitions."""
 import math
 import hashlib
+import functools
 import importlib.util
 import json
 import random
@@ -77,19 +78,155 @@ class RenderError(RuntimeError):
 PIPELINE_VERSION = "lossless-assembly-v1"
 
 
-def detect_video_encoder() -> dict:
-    """Detect common hardware encoders without calling providers."""
-    result = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True,
-                            timeout=15, check=False)
-    text = (result.stdout or "") + (result.stderr or "")
-    encoders = {
-        "nvenc": "h264_nvenc" if "h264_nvenc" in text else "",
-        "qsv": "h264_qsv" if "h264_qsv" in text else "",
-        "videotoolbox": "h264_videotoolbox" if "h264_videotoolbox" in text else "",
-        "software": "libx264",
+def _smoke_encoder(codec: str) -> bool:
+    if not shutil.which("ffmpeg"):
+        return False
+    try:
+        with tempfile.TemporaryDirectory(prefix="tubeforge-encoder-") as work:
+            output = Path(work) / "probe.mp4"
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=64x64:r=1",
+                 "-frames:v", "1", "-an", "-c:v", codec, "-f", "mp4", str(output)],
+                capture_output=True, text=True, timeout=8, check=False,
+            )
+            return result.returncode == 0 and output.is_file() and output.stat().st_size > 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+@functools.lru_cache(maxsize=1)
+def detect_video_encoder(family: str = "h264") -> dict:
+    """Return hardware encoders that pass a real one-frame FFmpeg encode, plus CPU fallback."""
+    family = "hevc" if family in ("hevc", "h265") else "h264"
+    candidates = {
+        "nvenc": f"{family}_nvenc",
+        "qsv": f"{family}_qsv",
+        "amf": f"{family}_amf",
     }
-    selected = next((value for key, value in encoders.items() if key != "software" and value), encoders["software"])
-    return {"encoders": encoders, "recommended": selected, "software_fallback": "libx264"}
+    if sys.platform == "darwin":
+        candidates["videotoolbox"] = f"{family}_videotoolbox"
+    encoders = {key: value if _smoke_encoder(value) else "" for key, value in candidates.items()}
+    software = "libx265" if family == "hevc" else "libx264"
+    selected = next((encoders[key] for key in ("nvenc", "qsv", "amf", "videotoolbox")
+                     if encoders[key]), software)
+    return {"encoders": encoders, "recommended": selected, "software_fallback": software}
+
+
+def detect_vulkan_tools() -> Dict[str, str]:
+    """Find optional Vulkan NCNN tools; absence never disables the FFmpeg export path."""
+    tools_dir = Path(__file__).resolve().parents[1] / "tools" / "vulkan"
+    result = {}
+    for key, names in (
+        ("rife", ("rife-ncnn-vulkan.exe", "rife-ncnn-vulkan")),
+        ("realesrgan", ("realesrgan-ncnn-vulkan.exe", "realesrgan-ncnn-vulkan")),
+    ):
+        found = next((str(tools_dir / name) for name in names if (tools_dir / name).is_file()), "")
+        if not found:
+            found = next((shutil.which(name) or "" for name in names if shutil.which(name)), "")
+        result[key] = found
+    return result
+
+
+def vulkan_video_postprocess(video_in: Path, cache_dir: Path, fps: int, *,
+                             upscale: bool = False, interpolation: str = "none",
+                             should_cancel: Optional[Callable[[], bool]] = None) -> Tuple[Path, Dict[str, Any]]:
+    """Optionally apply RIFE interpolation and/or Real-ESRGAN x4; return the input on missing tools."""
+    video_in, cache_dir = Path(video_in), Path(cache_dir)
+    if not video_in.is_file():
+        raise FileNotFoundError(f"Vulkan post-process input is missing: {video_in}")
+    if interpolation not in ("none", "rife-2x", "rife-4x"):
+        raise ValueError(f"Unsupported frame interpolation mode: {interpolation}")
+    if not upscale and interpolation == "none":
+        return video_in, {"applied": False, "cached": False, "warnings": []}
+    tools = detect_vulkan_tools()
+    missing = []
+    if upscale and not tools["realesrgan"]:
+        missing.append("realesrgan-ncnn-vulkan")
+    if interpolation != "none" and not tools["rife"]:
+        missing.append("rife-ncnn-vulkan")
+    if missing:
+        return video_in, {
+            "applied": False,
+            "cached": False,
+            "warnings": [f"Optional Vulkan tool(s) unavailable ({', '.join(missing)}); using FFmpeg export."],
+        }
+    key_builder = hashlib.sha256()
+    key_builder.update(_file_sha256(video_in).encode("ascii"))
+    key_builder.update(f":{fps}:{upscale}:{interpolation}:{tools}".encode("utf-8"))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    output = cache_dir / f"vulkan_{key_builder.hexdigest()[:24]}.mp4"
+    if output.is_file() and video_is_decodable(output, should_cancel):
+        return output, {"applied": True, "cached": True, "warnings": []}
+    if output.exists():
+        output.unlink()
+
+    def check_cancel() -> None:
+        if should_cancel and should_cancel():
+            raise Cancelled("Vulkan post-processing cancelled")
+
+    current = video_in
+    with tempfile.TemporaryDirectory(prefix="_vulkan_", dir=cache_dir) as temporary_dir:
+        temp = Path(temporary_dir)
+        if upscale:
+            check_cancel()
+            source_frames = temp / "input_frames"
+            output_frames = temp / "upscaled_frames"
+            source_frames.mkdir()
+            output_frames.mkdir()
+            extracted = _run_ffmpeg(
+                ["ffmpeg", "-y", "-v", "error", "-i", str(current), "-map", "0:v:0",
+                 "-fps_mode", "passthrough", "-start_number", "0", str(source_frames / "%08d.png")],
+                should_cancel,
+            )
+            if extracted.returncode:
+                raise RenderError(f"Could not extract frames for Vulkan upscaling: {_ffmpeg_reason(extracted.stderr)}")
+            upscale_result = subprocess.run(
+                [tools["realesrgan"], "-i", str(source_frames), "-o", str(output_frames),
+                 "-n", "realesrgan-x4plus", "-s", "4", "-f", "png"],
+                capture_output=True, text=True, timeout=max(1800, int(probe_duration(current) * 120)),
+            )
+            if upscale_result.returncode:
+                raise RenderError(f"Real-ESRGAN Vulkan upscaling failed: {upscale_result.stderr[-600:]}")
+            check_cancel()
+            frame_files = sorted(output_frames.glob("*.png"))
+            if not frame_files:
+                raise RenderError("Real-ESRGAN did not produce any upscaled frames.")
+            rebuilt = temp / "upscaled.mp4"
+            rebuilt_result = _run_ffmpeg(
+                ["ffmpeg", "-y", "-v", "error", "-framerate", str(fps), "-start_number", "0",
+                 "-i", str(output_frames / "%08d.png"), "-an", "-c:v", "libx264",
+                 "-preset", "veryfast", "-crf", "17", "-pix_fmt", "yuv420p", str(rebuilt)],
+                should_cancel,
+            )
+            if rebuilt_result.returncode:
+                raise RenderError(f"Could not assemble upscaled frames: {_ffmpeg_reason(rebuilt_result.stderr)}")
+            current = rebuilt
+        if interpolation != "none":
+            check_cancel()
+            factor = 2 if interpolation == "rife-2x" else 4
+            target_fps = min(60, max(fps, int(fps) * factor))
+            interpolated = temp / "interpolated.mp4"
+            result = subprocess.run(
+                [tools["rife"], "-i", str(current), "-o", str(interpolated),
+                 "-n", str(factor), "-f", str(target_fps)],
+                capture_output=True, text=True, timeout=max(1800, int(probe_duration(current) * 180)),
+            )
+            if result.returncode or not interpolated.is_file():
+                raise RenderError(f"RIFE Vulkan interpolation failed: {result.stderr[-600:]}")
+            check_cancel()
+            current = interpolated
+        if not video_is_decodable(current, should_cancel):
+            raise RenderError("Vulkan post-processing produced a video that FFmpeg cannot decode.")
+        temporary_output = output.with_suffix(".part.mp4")
+        copy_result = _run_ffmpeg(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(current), "-an", "-c:v", "copy",
+             "-movflags", "+faststart", str(temporary_output)],
+            should_cancel,
+        )
+        if copy_result.returncode:
+            raise RenderError(f"Could not cache Vulkan post-process output: {_ffmpeg_reason(copy_result.stderr)}")
+        temporary_output.replace(output)
+    return output, {"applied": True, "cached": False, "warnings": []}
 
 
 def pro_master_filter(master: str) -> str:
@@ -212,11 +349,15 @@ def motion_engine_status() -> Dict[str, Dict[str, Any]]:
     except ImportError:
         cpu_depth_available = False
     status["depthflow_3d"]["cpu_onnx_available"] = cpu_depth_available
-    if cpu_depth_available:
-        status["depthflow_3d"]["tiers"] = ["native_depthflow", "cpu_onnx_depth_parallax", "ffmpeg_parallax_fallback"]
-        status["depthflow_3d"]["active_tier"] = (
-            status["depthflow_3d"].get("active_tier") or "cpu_onnx_depth_parallax"
-        )
+    status["depthflow_3d"]["tiers"] = [
+        "tier_1_native_depthflow", "tier_2_cpu_onnx_depth_parallax", "tier_3_ffmpeg_2d_zoom",
+    ]
+    if status["depthflow_3d"]["installed"]:
+        status["depthflow_3d"]["active_tier"] = "tier_1_native_depthflow"
+    elif cpu_depth_available:
+        status["depthflow_3d"]["active_tier"] = "tier_2_cpu_onnx_depth_parallax"
+    else:
+        status["depthflow_3d"]["active_tier"] = "tier_3_ffmpeg_2d_zoom"
     engine_dir = Path(__file__).resolve().parents[1] / "remotion-engine"
     node_version = 0
     node = shutil.which("node")
@@ -948,6 +1089,8 @@ class SceneRenderSpec:
     dof: float = 0.0
     chroma: float = 0.0
     sharpen: float = 0.3
+    lut_path: Optional[Path] = None
+    lut_strength: float = 1.0
     motion_blur: bool = False
     animation: str = "None"
     video_source: str = "original_motion"
@@ -974,6 +1117,8 @@ class SceneRenderSpec:
     brand_position: str = "Top-Right"
     brand_overlay: bool = True
     work_dir: Optional[Path] = None
+    public_dir: Optional[Path] = None
+    encoder: str = "libx264"
 
 
 def _video_frames(path: Path, W: int, H: int, fps: int, duration: float, slowmo: bool):
@@ -1025,6 +1170,25 @@ def _look_filters(spec: SceneRenderSpec, mask_idx: Optional[int]) -> List[str]:
         chain.append("eq=brightness='0.035*sin(2*PI*t/2.4)':saturation='1.06+0.06*sin(2*PI*t/2.4)':eval=frame")
     segs.append(f"{cur}{','.join(chain)}[g0]")
     cur = "[g0]"
+    if spec.lut_path:
+        lut_path = Path(spec.lut_path)
+        if not lut_path.is_file() or lut_path.suffix.lower() != ".cube":
+            raise RenderError(f"Selected 3D LUT is missing or is not a .cube file: {lut_path}")
+        try:
+            validate_cube_lut_text(lut_path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise RenderError(f"Selected 3D LUT is invalid: {exc}") from exc
+    if spec.lut_path and spec.lut_strength > 0.0:
+        strength = min(1.0, max(0.0, float(spec.lut_strength)))
+        lut = f"lut3d=file='{_escape_filter_path(Path(spec.lut_path))}':interp=tetrahedral"
+        if strength >= 0.999:
+            segs.append(f"{cur}{lut}[glut]")
+        else:
+            segs.append(
+                f"{cur}split[lutbase][lutinput];[lutinput]{lut}[lutgraded];"
+                f"[lutbase][lutgraded]blend=all_expr='A*(1-{strength:.4f})+B*{strength:.4f}'[glut]"
+            )
+        cur = "[glut]"
     if spec.bloom > 0.01:
         segs.append(f"{cur}split[b1][b2];[b2]scale={max(2, W // 4)}:{max(2, H // 4)},"
                     f"curves=all='0/0 0.6/0.05 1/1',gblur=sigma={4 + 6 * spec.bloom:.1f},scale={W}:{H}[bb];"
@@ -1059,6 +1223,51 @@ def _look_filters(spec: SceneRenderSpec, mask_idx: Optional[int]) -> List[str]:
     post.append("format=yuv420p")
     segs.append(f"{cur}{','.join(post)}[look]")
     return segs
+
+
+def validate_cube_lut_text(contents: str) -> int:
+    """Validate a bounded 3D .cube LUT before it reaches FFmpeg's filter graph."""
+    if not isinstance(contents, str) or len(contents.encode("utf-8")) > 4 * 1024 * 1024:
+        raise ValueError("A .cube LUT must be text no larger than 4 MiB.")
+    size = None
+    values = 0
+    for raw_line in contents.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or line.upper().startswith("TITLE "):
+            continue
+        parts = line.split()
+        if parts[0] == "LUT_3D_SIZE":
+            if len(parts) != 2 or size is not None:
+                raise ValueError("The .cube LUT must declare one LUT_3D_SIZE.")
+            try:
+                size = int(parts[1])
+            except ValueError as exc:
+                raise ValueError("LUT_3D_SIZE must be an integer.") from exc
+            if not 2 <= size <= 65:
+                raise ValueError("LUT_3D_SIZE must be between 2 and 65.")
+            continue
+        if parts[0] in ("DOMAIN_MIN", "DOMAIN_MAX"):
+            if len(parts) != 4:
+                raise ValueError(f"{parts[0]} must contain three values.")
+            try:
+                domain = [float(value) for value in parts[1:]]
+            except ValueError as exc:
+                raise ValueError(f"{parts[0]} values must be numeric.") from exc
+            if not all(math.isfinite(value) for value in domain):
+                raise ValueError(f"{parts[0]} values must be finite.")
+            continue
+        if len(parts) != 3:
+            raise ValueError("Every .cube LUT entry must contain three RGB values.")
+        try:
+            rgb = [float(value) for value in parts]
+        except ValueError as exc:
+            raise ValueError("Every .cube LUT entry must be numeric.") from exc
+        if not all(math.isfinite(value) for value in rgb):
+            raise ValueError("Every .cube LUT entry must be finite.")
+        values += 1
+    if size is None or values != size ** 3:
+        raise ValueError("The .cube LUT must contain exactly LUT_3D_SIZE cubed RGB entries.")
+    return size
 
 
 def _run_motion_worker(worker: Path, payload: Dict[str, Any], work: Path,
@@ -1183,6 +1392,7 @@ def _render_motion_scene(spec: SceneRenderSpec, progress: Optional[Callable[[flo
             "width": spec.width,
             "height": spec.height,
             "fps": spec.fps,
+            "public_dir": str(spec.public_dir) if spec.public_dir else "",
         }
 
     try:
@@ -1240,15 +1450,24 @@ def render_scene(spec: SceneRenderSpec, progress: Optional[Callable[[float], Non
                  should_cancel: Optional[Callable[[], bool]] = None,
                  log: Optional[Callable[[str], None]] = None) -> Path:
     """Render a scene, dispatching optional local engines with a built-in-motion fallback."""
-    if spec.video_source == "procedural_3d_2d":
-        return _render_motion_scene(spec, progress, should_cancel, log)
-    if spec.video_source in ("depthflow_3d", "cutout_2d") and spec.source_type == "image":
-        return _render_motion_scene(spec, progress, should_cancel, log)
-    if spec.video_source in ("depthflow_3d", "cutout_2d") and log:
-        log(f"⚠️ {spec.video_source} requires a still image; using the selected uploaded/stock video as-is.")
-    if spec.video_source in ("depthflow_3d", "cutout_2d"):
-        _record_motion_status(spec.video_source, "fallback", "Engine skipped because the scene source is video.")
-    return _render_scene_base(spec, progress, should_cancel)
+    try:
+        if spec.video_source == "procedural_3d_2d":
+            return _render_motion_scene(spec, progress, should_cancel, log)
+        if spec.video_source in ("depthflow_3d", "cutout_2d") and spec.source_type == "image":
+            return _render_motion_scene(spec, progress, should_cancel, log)
+        if spec.video_source in ("depthflow_3d", "cutout_2d") and log:
+            log(f"⚠️ {spec.video_source} requires a still image; using the selected uploaded/stock video as-is.")
+        if spec.video_source in ("depthflow_3d", "cutout_2d"):
+            _record_motion_status(spec.video_source, "fallback", "Engine skipped because the scene source is video.")
+        return _render_scene_base(spec, progress, should_cancel)
+    except Cancelled:
+        raise
+    except Exception as error:
+        if spec.encoder == "libx264":
+            raise
+        if log:
+            log(f"⚠️ Hardware encoder {spec.encoder} failed ({error}); retrying with libx264.")
+        return render_scene(replace(spec, encoder="libx264"), progress, should_cancel, log)
 
 
 def _render_scene_base(spec: SceneRenderSpec, progress: Optional[Callable[[float], None]] = None,
@@ -1339,9 +1558,18 @@ def _render_scene_base(spec: SceneRenderSpec, progress: Optional[Callable[[float
     else:
         segs.append(f"{cur}format=yuv420p[vout]")
     tmp_out = spec.out_path.with_name(spec.out_path.stem + ".part.mp4")
+    encoder = spec.encoder or "libx264"
     cmd = ["ffmpeg", "-y", "-v", "error", *inputs, "-filter_complex", ";".join(segs), "-map", "[vout]",
-           "-frames:v", str(n_frames), "-c:v", "libx264", "-preset", spec.preset, "-crf", str(spec.crf),
-           "-pix_fmt", "yuv420p", "-r", str(fps), "-movflags", "+faststart", str(tmp_out)]
+           "-frames:v", str(n_frames), "-c:v", encoder]
+    if encoder.endswith("_nvenc"):
+        cmd += ["-preset", "p4", "-cq", str(spec.crf), "-b:v", "0"]
+    elif encoder.endswith("_qsv"):
+        cmd += ["-global_quality", str(spec.crf)]
+    elif encoder.endswith("_amf"):
+        cmd += ["-quality", "balanced", "-qp_i", str(spec.crf)]
+    else:
+        cmd += ["-preset", spec.preset, "-crf", str(spec.crf)]
+    cmd += ["-pix_fmt", "yuv420p", "-r", str(fps), "-movflags", "+faststart", str(tmp_out)]
     err_path = work / f"_{stem}_ffmpeg.log"
     with open(err_path, "wb") as errf:
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=errf)
@@ -1564,9 +1792,17 @@ def split_video_clip(path: Path, boundaries: Sequence[float], out_dir: Path, fps
         command = [
             "ffmpeg", "-y", "-v", "error", "-ss", f"{start:.4f}", "-i", str(path),
             "-t", f"{end - start:.4f}", "-an", "-vf", f"fps={fps},format=yuv420p",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", str(temporary),
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18", str(temporary),
         ]
-        result = subprocess.run(command, capture_output=True, text=True, timeout=max(120, int((end - start) * 20)))
+        timeout = max(600, int((end - start) * 120))
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            temporary.unlink(missing_ok=True)
+            raise RenderError(
+                f"FFmpeg timed out after {timeout} seconds while splitting {path.name} "
+                f"({end - start:.2f}-second segment)."
+            ) from exc
         if result.returncode:
             temporary.unlink(missing_ok=True)
             raise RenderError(f"Could not split {path.name} at a word-aligned beat: {result.stderr[-400:]}")
@@ -1619,6 +1855,18 @@ def export_final(video_in: Path, audio_in: Optional[Path], out: Path, width: int
                 "-cpu-used", "4"]
         if audio_in:
             cmd += ["-c:a", "libopus", "-b:a", "192k"]
+    elif codec.endswith("_nvenc"):
+        cmd += ["-preset", "p4", "-cq", str(crf), "-b:v", "0"]
+        if audio_in:
+            cmd += ["-c:a", "aac", "-b:a", "256k"]
+    elif codec.endswith("_qsv"):
+        cmd += ["-global_quality", str(crf)]
+        if audio_in:
+            cmd += ["-c:a", "aac", "-b:a", "256k"]
+    elif codec.endswith("_amf"):
+        cmd += ["-quality", "balanced", "-qp_i", str(crf)]
+        if audio_in:
+            cmd += ["-c:a", "aac", "-b:a", "256k"]
     else:
         cmd += ["-c:v", codec, "-preset", preset, "-crf", str(crf + (2 if codec == "libx265" else 0))]
         if codec == "libx265":
@@ -1631,6 +1879,10 @@ def export_final(video_in: Path, audio_in: Optional[Path], out: Path, width: int
     cmd.append(str(out))
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode != 0:
+        if codec.endswith(("_nvenc", "_qsv", "_amf", "_videotoolbox")):
+            fallback = "libx265" if codec.startswith(("hevc_", "h265_")) else "libx264"
+            return export_final(video_in, audio_in, out, width, height, fps, fallback, crf, preset,
+                                fade_in, fade_out, duration, subtitle_ass)
         raise RenderError(f"FFmpeg export failed: {res.stderr[-500:]}")
     return out
 

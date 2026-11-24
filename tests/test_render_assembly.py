@@ -52,6 +52,24 @@ class VideoDecodabilityTests(unittest.TestCase):
         self.assertEqual(decode.call_count, 3)
         self.assertEqual(rebuilt_bytes, b"encoded beat")
 
+    def test_timed_out_beat_encode_cleans_partial_output_and_reports_render_error(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "scene.mp4"
+            source.write_bytes(b"source")
+            output_dir = root / "beats"
+
+            def fake_run(command, **kwargs):
+                if command[0] == "ffprobe":
+                    return subprocess.CompletedProcess(command, 0, "2.0\n", "")
+                raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+            with patch.object(render.subprocess, "run", side_effect=fake_run):
+                with self.assertRaisesRegex(render.RenderError, "timed out after 600 seconds"):
+                    render.split_video_clip(source, [0.0, 1.0, 2.0], output_dir, 30)
+
+            self.assertFalse((output_dir / "scene_beat_000.part.mkv").exists())
+
     def test_assembly_without_kinetic_captions_exports_with_no_ass_file(self):
         class FakeTrack:
             def __init__(self, _path, _seconds):

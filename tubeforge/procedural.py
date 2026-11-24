@@ -1,12 +1,15 @@
 """Strict, backwards-compatible props preparation for the optional Remotion scene engine."""
 import math
 import re
+from pathlib import Path
 from typing import Any, Dict, Iterable
 
 TEMPLATES = (
     "3d_bar_chart", "3d_stat_callout", "comparison_split", "timeline_journey", "process_flow",
-    "quote_evidence_card", "2d_character_explainer", "kinetic_hook_title",
+    "quote_evidence_card", "2d_character_explainer", "kinetic_hook_title", "map_route_animator",
+    "3d_model_showcase",
 )
+MODEL_PUBLIC_DIR = Path(__file__).resolve().parents[1] / "remotion-engine" / "public"
 
 
 def _text(value: Any, default: str, limit: int = 200) -> str:
@@ -42,7 +45,8 @@ def _metric_rows(value: Any) -> list:
     return rows
 
 
-def scene_props(scene, settings: Dict[str, Any], duration: float, research_sources: Iterable[str]) -> Dict[str, Any]:
+def scene_props(scene, settings: Dict[str, Any], duration: float, research_sources: Iterable[str],
+                model_public_dir: Path = MODEL_PUBLIC_DIR) -> Dict[str, Any]:
     """Build the exact shape validated by the isolated Zod schema before invoking Remotion."""
     data = scene.procedural_props
     if not isinstance(data, dict):
@@ -59,6 +63,8 @@ def scene_props(scene, settings: Dict[str, Any], duration: float, research_sourc
         "quote_evidence_card": {"quote", "source", "context"},
         "2d_character_explainer": {"characterName", "characterSvg", "emotion", "mouthStateTimeline"},
         "kinetic_hook_title": {"hookText", "kicker"},
+        "map_route_animator": {"cities", "routes", "highlightCountries", "mapCenter", "zoom"},
+        "3d_model_showcase": {"modelUrl", "calloutTitle"},
     }
     _check_keys(data, allowed_fields[template], "template props")
     props: Dict[str, Any] = {
@@ -207,4 +213,85 @@ def scene_props(scene, settings: Dict[str, Any], duration: float, research_sourc
             "hookText": _text(data.get("hookText"), scene.title or "The Hidden Truth", 160),
             "kicker": _text(data.get("kicker"), "WATCH THIS", 80),
         })
+    elif template == "map_route_animator":
+        cities = data.get("cities", [
+            {"name": "Origin", "longitude": -73.9, "latitude": 40.7},
+            {"name": "Destination", "longitude": 2.3, "latitude": 48.9},
+        ])
+        if not isinstance(cities, list) or not 2 <= len(cities) <= 12:
+            raise ValueError("A route map needs between two and twelve cities.")
+        clean_cities = []
+        city_names = set()
+        for city in cities:
+            if not isinstance(city, dict):
+                raise ValueError("Each map city must be a JSON object.")
+            _check_keys(city, {"name", "longitude", "latitude"}, "map city")
+            name = _text(city.get("name"), "City", 60)
+            longitude, latitude = city.get("longitude"), city.get("latitude")
+            if (not isinstance(longitude, (int, float)) or isinstance(longitude, bool)
+                    or not math.isfinite(float(longitude)) or not -180 <= longitude <= 180):
+                raise ValueError(f"Longitude for {name} must be between -180 and 180.")
+            if (not isinstance(latitude, (int, float)) or isinstance(latitude, bool)
+                    or not math.isfinite(float(latitude)) or not -90 <= latitude <= 90):
+                raise ValueError(f"Latitude for {name} must be between -90 and 90.")
+            if name in city_names:
+                raise ValueError("Map city names must be unique.")
+            city_names.add(name)
+            clean_cities.append({"name": name, "longitude": float(longitude), "latitude": float(latitude)})
+        routes = data.get("routes", [{"from": clean_cities[0]["name"], "to": clean_cities[1]["name"], "label": ""}])
+        if not isinstance(routes, list) or not 1 <= len(routes) <= 12:
+            raise ValueError("A route map needs between one and twelve routes.")
+        clean_routes = []
+        for route in routes:
+            if not isinstance(route, dict):
+                raise ValueError("Each map route must be a JSON object.")
+            _check_keys(route, {"from", "to", "label"}, "map route")
+            origin = _text(route.get("from"), "", 60)
+            destination = _text(route.get("to"), "", 60)
+            if origin not in city_names or destination not in city_names or origin == destination:
+                raise ValueError("Each map route must connect two different listed cities.")
+            clean_routes.append({"from": origin, "to": destination, "label": _text(route.get("label"), "", 80)})
+        highlights = data.get("highlightCountries", [])
+        if (not isinstance(highlights, list) or len(highlights) > 20
+                or any(not isinstance(code, (str, int)) or not re.fullmatch(r"\d{1,3}", str(code))
+                       for code in highlights)):
+            raise ValueError("Country highlights must use up to 20 numeric ISO-3166 country codes.")
+        center = data.get("mapCenter", {"longitude": 0.0, "latitude": 20.0})
+        if not isinstance(center, dict):
+            raise ValueError("mapCenter must contain longitude and latitude.")
+        _check_keys(center, {"longitude", "latitude"}, "map center")
+        center_lon, center_lat = center.get("longitude", 0), center.get("latitude", 20)
+        if (not isinstance(center_lon, (int, float)) or isinstance(center_lon, bool)
+                or not math.isfinite(float(center_lon)) or not -180 <= center_lon <= 180
+                or not isinstance(center_lat, (int, float)) or isinstance(center_lat, bool)
+                or not math.isfinite(float(center_lat)) or not -90 <= center_lat <= 90):
+            raise ValueError("mapCenter coordinates are outside valid longitude/latitude ranges.")
+        zoom = data.get("zoom", 1.0)
+        if (not isinstance(zoom, (int, float)) or isinstance(zoom, bool)
+                or not math.isfinite(float(zoom)) or not 1 <= zoom <= 4):
+            raise ValueError("Map zoom must be between 1 and 4.")
+        props.update({
+            "cities": clean_cities,
+            "routes": clean_routes,
+            "highlightCountries": [str(code) for code in highlights],
+            "mapCenter": {"longitude": float(center_lon), "latitude": float(center_lat)},
+            "zoom": float(zoom),
+        })
+    elif template == "3d_model_showcase":
+        model_url = _text(data.get("modelUrl"), "", 240).replace("\\", "/")
+        if model_url:
+            model_path = Path(model_url)
+            public_dir = Path(model_public_dir).resolve()
+            target = (public_dir / model_path).resolve()
+            try:
+                target.relative_to(public_dir)
+            except ValueError as exc:
+                raise ValueError("Model paths must stay inside the Remotion public/models directory.") from exc
+            if (model_path.is_absolute() or not model_url.startswith("models/")
+                    or model_path.suffix.lower() not in (".glb", ".gltf")):
+                raise ValueError("Model URL must be a relative .glb or .gltf path under public/models.")
+            if not target.is_file():
+                raise ValueError(f"3D model file was not found in the Remotion public directory: {model_url}")
+        props.update({"modelUrl": model_url,
+                      "calloutTitle": _text(data.get("calloutTitle"), scene.title or "Featured model", 120)})
     return props

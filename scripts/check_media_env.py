@@ -7,6 +7,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -54,6 +55,45 @@ def check_ffmpeg(name: str) -> Dict:
         "path": path,
         "version": version,
         "detail": "" if code == 0 else err or "command failed",
+    }
+
+
+def smoke_encoder(codec: str) -> Dict:
+    ffmpeg = executable("ffmpeg")
+    if not ffmpeg:
+        return {"available": False, "detail": "ffmpeg is not on PATH"}
+    try:
+        with tempfile.TemporaryDirectory(prefix="tubeforge-encoder-") as directory:
+            output = Path(directory) / "probe.mp4"
+            result = subprocess.run(
+                [ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=64x64:r=1",
+                 "-frames:v", "1", "-an", "-c:v", codec, "-f", "mp4", str(output)],
+                capture_output=True, text=True, timeout=20, check=False,
+            )
+            available = result.returncode == 0 and output.is_file() and output.stat().st_size > 0
+            return {"available": available, "detail": "" if available else (result.stderr or "smoke encode failed")[-300:]}
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"available": False, "detail": str(exc)}
+
+
+def check_hardware_encoders() -> Dict:
+    names = ("h264_nvenc", "hevc_nvenc", "h264_qsv", "hevc_qsv", "h264_amf", "hevc_amf")
+    return {name: smoke_encoder(name) for name in names}
+
+
+def check_vulkan_tools() -> Dict:
+    tools = {}
+    bundled = Path(__file__).resolve().parents[1] / "tools" / "vulkan"
+    for key, names in (
+        ("rife", ("rife-ncnn-vulkan.exe", "rife-ncnn-vulkan")),
+        ("realesrgan", ("realesrgan-ncnn-vulkan.exe", "realesrgan-ncnn-vulkan")),
+    ):
+        path = next((str(bundled / name) for name in names if (bundled / name).is_file()), "")
+        tools[key] = path or next((shutil.which(name) or "" for name in names if shutil.which(name)), "")
+    return {
+        "available": {name: bool(path) for name, path in tools.items()},
+        "paths": tools,
+        "fallback": "FFmpeg",
     }
 
 
@@ -163,17 +203,24 @@ def main() -> int:
         onnxruntime = None
         cpu_3d = False
     gpu = windows_gpu_status()
-    depth_tier = "tier_3_ffmpeg_2d_zoom"
-    if cpu_3d:
-        depth_tier = "tier_2_cpu_onnx_depth_parallax"
-    if gpu["nvidia_smi"]:
-        depth_tier = "tier_1_native_depthflow_or_gpu"
+    try:
+        import importlib.util
+        native_depthflow = importlib.util.find_spec("depthflow") is not None
+    except (ImportError, ValueError):
+        native_depthflow = False
+    depth_tier = ("tier_1_native_depthflow" if native_depthflow else
+                  "tier_2_cpu_onnx_depth_parallax" if cpu_3d else "tier_3_ffmpeg_2d_zoom")
     report = {
         "ffmpeg": check_ffmpeg("ffmpeg"),
         "ffprobe": check_ffmpeg("ffprobe"),
+        "video_encoders": {
+            "hardware_smoke_tests": check_hardware_encoders(),
+            "cpu_fallbacks": {"h264": "libx264", "hevc": "libx265"},
+        },
         "node": check_node(),
         "python": check_python(),
         "gpu": gpu,
+        "vulkan_postprocessing": check_vulkan_tools(),
         "depth_parallax": {
             "active_tier": depth_tier,
             "tiers": [

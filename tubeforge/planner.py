@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from . import cinema, llm
 
 WORDS_PER_SEC = 2.35
+MAX_SCENES = 250
 
 
 def _s(v: Any) -> str:
@@ -65,6 +66,7 @@ class Scene(BaseModel):
     id: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])
     title: str = ""
     act: str = ""
+    chapter: str = "Chapter 1"
     narration: str = ""
     is_hero_scene: bool = False
     hero_clip: str = ""
@@ -209,6 +211,18 @@ class CinematicPlan(BaseModel):
         return next((m for m in cinema.MUSIC_MOODS if m in v), "epic")
 
 
+def group_chapters(scenes: List[Scene]) -> List[tuple[str, List[tuple[int, Scene]]]]:
+    """Return stable chapter groups while keeping the legacy flat scene list canonical."""
+    groups: List[tuple[str, List[tuple[int, Scene]]]] = []
+    by_name: Dict[str, List[tuple[int, Scene]]] = {}
+    for index, scene in enumerate(scenes):
+        name = str(scene.chapter or "").strip() or "Chapter 1"
+        by_name.setdefault(name, []).append((index, scene))
+    for name, items in by_name.items():
+        groups.append((name, items))
+    return groups
+
+
 VOCAB = (
     f"camera_move one of: {', '.join(cinema.CAMERA_MOVES)}.\n"
     f"camera_angle one of: {', '.join(cinema.CAMERA_ANGLES)}.\n"
@@ -302,7 +316,8 @@ def _scenes_prompt(treat: dict, style: str, beats: List[str], start_index: int, 
         "\"original_motion\", use \"procedural_3d_2d\" for roughly 20-30% of scenes whose narration contains a "
         "statistic, money amount, date, comparison, or a verified fact); proceduralTemplate (one of "
         "\"3d_bar_chart\", \"3d_stat_callout\", \"comparison_split\", \"timeline_journey\", \"process_flow\", "
-        "\"quote_evidence_card\", \"2d_character_explainer\", or \"kinetic_hook_title\"); proceduralProps (strict JSON matching that template; quote_evidence_card "
+        "\"quote_evidence_card\", \"2d_character_explainer\", \"kinetic_hook_title\", \"map_route_animator\", or "
+        "\"3d_model_showcase\"); proceduralProps (strict JSON matching that template; quote_evidence_card "
         "MUST cite an exact source supplied in Story/research sources and MUST NOT invent a citation). Use "
         "\"original_motion\" and empty proceduralProps for ordinary narrative scenes.\n"
         "Procedural property shapes: 3d_bar_chart={\"subtitle\":\"...\",\"unit\":\"...\",\"bars\":[{\"label\":\"...\","
@@ -313,7 +328,13 @@ def _scenes_prompt(treat: dict, style: str, beats: List[str], start_index: int, 
         "process_flow={\"steps\":[{\"label\":\"...\",\"caption\":\"...\"}]}; "
         "quote_evidence_card={\"quote\":\"...\",\"source\":\"exact user-provided source\",\"context\":\"...\"}.\n"
         "2d_character_explainer={\"characterName\":\"...\",\"emotion\":\"explaining\",\"mouthStateTimeline\":[]}; "
-        "kinetic_hook_title={\"hookText\":\"...\",\"kicker\":\"WATCH THIS\"}. "
+        "kinetic_hook_title={\"hookText\":\"...\",\"kicker\":\"WATCH THIS\"}; "
+        "map_route_animator={\"cities\":[{\"name\":\"A\",\"longitude\":-73.9,\"latitude\":40.7},"
+        "{\"name\":\"B\",\"longitude\":2.3,\"latitude\":48.9}],\"routes\":[{\"from\":\"A\",\"to\":\"B\","
+        "\"label\":\"...\"}],\"highlightCountries\":[\"840\"],\"mapCenter\":{\"longitude\":0,\"latitude\":20},"
+        "\"zoom\":1}; 3d_model_showcase={\"modelUrl\":\"models/<uploaded-file>.glb\","
+        "\"calloutTitle\":\"...\"}. Use numeric ISO-3166 country codes for map highlights. "
+        "Only use modelUrl values returned by the Studio model uploader. "
         "Vary shot types and camera moves for rhythm (wide -> medium -> close-up), use the opening scene for an "
         "establishing shot and a Title overlay with the film title, and keep continuity of characters and places.\n"
         + VOCAB
@@ -408,7 +429,7 @@ def generate_plan(
     voice_branding: bool = False,
     target_minutes: float = 0.0,
 ) -> CinematicPlan:
-    n_scenes = int(max(1, min(50, n_scenes)))
+    n_scenes = int(max(1, min(MAX_SCENES, n_scenes)))
     fixed: Optional[List[str]] = None
     if script.strip():
         fixed = split_script(script, n_scenes)
@@ -496,6 +517,9 @@ def generate_plan(
                 elif alias and alias in raw_scene:
                     scene_values[name] = raw_scene[alias]
             sc = Scene(**scene_values)
+            scene_index = len(scenes)
+            if not isinstance(raw_scene.get("chapter"), str) or not raw_scene["chapter"].strip():
+                sc.chapter = f"Chapter {scene_index // 10 + 1}"
             scenes.append(sc.normalise(style, scene_duration))
     if fixed:
         for sc, txt in zip(scenes, fixed):
@@ -532,6 +556,7 @@ def regenerate_scene(plan: CinematicPlan, index: int, style: str, scene_duration
     new = Scene(**scene_values)
     new.id = sc.id
     new.source = sc.source
+    new.chapter = sc.chapter
     return new.normalise(style, scene_duration)
 
 
@@ -560,7 +585,7 @@ def auto_cinematic(idea: str, log=None) -> Dict[str, Any]:
     data, model = llm.complete_json(
         SYSTEM,
         f"Choose the optimal production settings for this film idea.\nIDEA: {idea}\n{opts}\n"
-        "scene_count: integer 4-50 (more for longer epic stories), scene_duration: seconds 4-10, "
+        "scene_count: integer 4-250 (more for longer epic stories), scene_duration: seconds 4-10, "
         "camera_intensity: 0.5-1.6, letterbox: true/false (true for epic cinema), tone: short phrase, "
         "audience: short phrase, film_grain: 0-1, bloom: 0-1, halation: 0-0.5 (film highlight glow; 0 for clean/3D/"
         "commercial looks), gate_weave: true/false (true only for vintage/film-stock looks), reason: one sentence.\n"
@@ -570,7 +595,7 @@ def auto_cinematic(idea: str, log=None) -> Dict[str, Any]:
     for k, v in AUTO_KEYS.items():
         out[k] = cinema.closest(_s(data.get(k)), v, v[0])
     try:
-        out["scene_count"] = int(max(4, min(50, int(float(_s(data.get("scene_count")) or 8)))))
+        out["scene_count"] = int(max(4, min(MAX_SCENES, int(float(_s(data.get("scene_count")) or 8)))))
     except ValueError:
         out["scene_count"] = 8
     for k, lo, hi, d in (("scene_duration", 4, 10, 6), ("camera_intensity", 0.5, 1.6, 1.0), ("film_grain", 0, 1, 0.35),

@@ -1,0 +1,9 @@
+# Optional CPU depth inference for the Tier 2 parallax renderer.
+onnxruntime>=1.18,<2
+
+# Optional thumbnail cutouts and local semantic B-roll search.
+rembg>=2.0,<3
+open_clip_torch>=2.24,<3
+
+# Optional template-only Manim CE scene worker. Blender is a separate application.
+manim>=0.18,<1

@@ -1,8 +1,11 @@
 """Video sources: OpenRouter AI video generation and Pixabay/Pexels stock footage."""
 import base64
 import io
+import json
 import math
 import re
+import shutil
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,7 +13,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from PIL import Image
 
-from . import cache, config
+from . import broll_vault, cache, config
 from .http import ProviderError, breaker_reason, request, trip_breaker
 
 OR_VIDEOS = "https://openrouter.ai/api/v1/videos"
@@ -468,6 +471,14 @@ def search_stock_videos(query: str, portrait: bool = False, min_width: int = 128
 
 
 def download_stock_clip(clip: StockClip, out_path: Path) -> Path:
+    if clip.provider == "Local Vault":
+        source = Path(clip.url)
+        if not source.is_file():
+            raise VideoGenError("Selected Local Vault clip is missing.")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        if source.resolve() != Path(out_path).resolve():
+            shutil.copy2(source, out_path)
+        return out_path
     provider_key = clip.provider.lower()
     ck = cache.cache_key(provider_key + "_clip", clip.id, clip.url)
     data = cache.get_bytes("video", ck, ".mp4")
@@ -482,6 +493,31 @@ def download_stock_clip(clip: StockClip, out_path: Path) -> Path:
 
 def fetch_stock_clip(query: str, out_path: Path, portrait: bool, min_seconds: float, min_width: int,
                      variant: int = 0) -> Optional[StockClip]:
+    local = broll_vault.find_video(query)
+    if local:
+        path = Path(local["path"])
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration:stream=width,height",
+             "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        try:
+            metadata = json.loads(probe.stdout)
+            stream = next((item for item in metadata.get("streams", [])
+                           if item.get("width") and item.get("height")), {})
+            width, height = int(stream.get("width", 0)), int(stream.get("height", 0))
+            duration = float((metadata.get("format") or {}).get("duration") or 0)
+        except (ValueError, TypeError, StopIteration):
+            width = height = 0
+            duration = 0.0
+        if (probe.returncode == 0 and width and height and duration >= min(min_seconds, 8)
+                and (height > width) == portrait and max(width, height) >= min_width):
+            clip = StockClip(
+                f"vault-{local['sha256'][:12]}", str(path), width, height, duration, "",
+                "Local file", str(path), "Local Vault",
+            )
+            download_stock_clip(clip, out_path)
+            return clip
     clips = search_stock_videos(query, portrait, min_width)
     if not clips:
         words = query.split()

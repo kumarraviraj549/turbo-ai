@@ -1,0 +1,3 @@
+-r requirements.txt
+opentimelineio>=0.17,<0.18
+librosa>=0.10.2,<1.0

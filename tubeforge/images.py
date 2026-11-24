@@ -14,7 +14,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from PIL import Image
 
-from . import cache, config
+from . import broll_vault, cache, config
 from .http import ProviderError, breaker_reason, quota_cooldown, request, trip_breaker
 
 BROWSER_HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) TubeForgeStudio/2.0"}
@@ -386,6 +386,9 @@ def _pollinations(prompt: str, w: int, h: int, seed: int, with_key: bool, log) -
 
 
 def _pixabay_photo(query: str, w: int, h: int, seed: int) -> Tuple[bytes, str]:
+    local = broll_vault.find_image(query)
+    if local:
+        return Path(local["path"]).read_bytes(), f"Local vault image · {local['name']}"
     portrait = h > w
     params = {"key": config.pixabay_key(), "q": query[:100], "image_type": "photo", "safesearch": "true",
               "orientation": "vertical" if portrait else "horizontal", "per_page": 20,
@@ -420,6 +423,9 @@ def _pexels_request(url: str, params: dict):
 
 
 def _pexels_photo(query: str, w: int, h: int, seed: int) -> Tuple[bytes, str]:
+    local = broll_vault.find_image(query)
+    if local:
+        return Path(local["path"]).read_bytes(), f"Local vault image · {local['name']}"
     orientation = "portrait" if h > w else "landscape"
     params = {"query": query[:100], "orientation": orientation, "size": "large", "per_page": 20}
     ck = cache.cache_key("pexels_photo", params["query"], orientation)

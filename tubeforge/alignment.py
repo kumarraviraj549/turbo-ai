@@ -3,11 +3,14 @@ import hashlib
 import json
 import math
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence
+
+import numpy as np
 
 from . import config
 from .http import ProviderError, request
@@ -19,6 +22,110 @@ _ALIGN_LOCK = threading.Lock()
 
 class AlignmentError(RuntimeError):
     pass
+
+
+def _rhubarb_executable() -> Optional[str]:
+    found = shutil.which("rhubarb")
+    if found:
+        return found
+    root = Path(__file__).resolve().parents[1] / "tools"
+    return next((str(path) for path in (root / "rhubarb.exe", root / "rhubarb")
+                 if path.is_file()), None)
+
+
+def build_mouth_state_timeline(parts: Sequence[tuple[Path, float]], fps: int, cache_path: Path) -> List[dict]:
+    """Create frame-based mouth states from voice audio, cached by source content and timing."""
+    digest = hashlib.sha256()
+    digest.update(f"mouth-v1:{fps}".encode("ascii"))
+    for path, offset in parts:
+        digest.update(f"{float(offset):.6f}".encode("ascii"))
+        digest.update(audio_sha256(Path(path)).encode("ascii"))
+    cache_key = digest.hexdigest()
+    if cache_path.is_file():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if cached.get("cache_key") == cache_key and isinstance(cached.get("timeline"), list):
+                return cached["timeline"]
+        except (OSError, ValueError, AttributeError):
+            pass
+
+    timeline = []
+    rhubarb = _rhubarb_executable()
+    for path, offset in parts:
+        source = Path(path)
+        if not source.is_file():
+            raise AlignmentError(f"Voice audio is missing for lip-sync: {source}")
+        cues = []
+        if rhubarb:
+            with tempfile.TemporaryDirectory(prefix="tubeforge-mouth-") as work:
+                wav_path = Path(work) / "voice.wav"
+                json_path = Path(work) / "mouth.json"
+                converted = subprocess.run(
+                    ["ffmpeg", "-y", "-v", "error", "-i", str(source), "-ac", "1", "-ar", "16000",
+                     "-c:a", "pcm_s16le", str(wav_path)], capture_output=True, text=True, timeout=120,
+                )
+                if converted.returncode:
+                    raise AlignmentError(f"Could not prepare voice audio for Rhubarb: {converted.stderr[-300:]}")
+                result = subprocess.run([rhubarb, "-f", "json", "-o", str(json_path), str(wav_path)],
+                                        capture_output=True, text=True, timeout=300)
+                if result.returncode == 0 and json_path.is_file():
+                    payload = json.loads(json_path.read_text(encoding="utf-8"))
+                    shape_map = {"X": "closed", "A": "half", "B": "half", "C": "open",
+                                 "D": "wide", "E": "wide", "F": "wide"}
+                    cues = [{"start": float(item["start"]), "end": float(item["end"]),
+                             "mouth": shape_map.get(str(item.get("value", "X")), "closed")}
+                            for item in payload.get("mouthCues", [])
+                            if float(item.get("end", 0)) > float(item.get("start", 0))]
+        if not cues:
+            result = subprocess.run(
+                ["ffmpeg", "-v", "error", "-i", str(source), "-ac", "1", "-ar", "16000",
+                 "-f", "f32le", "-"],
+                capture_output=True, timeout=120,
+            )
+            if result.returncode:
+                raise AlignmentError(f"Could not decode voice for lip-sync: {source.name}")
+            samples = np.frombuffer(result.stdout, dtype="<f4")
+            window = 320
+            frames = samples[:len(samples) // window * window].reshape(-1, window)
+            if not len(frames):
+                continue
+            rms = np.sqrt(np.mean(frames * frames, axis=1))
+            zcr = np.mean(np.diff(np.signbit(frames).astype(np.int8), axis=1) != 0, axis=1)
+            peak = max(float(np.percentile(rms, 95)), 1e-5)
+            normalized = rms / peak
+            for index, energy in enumerate(normalized):
+                if energy < 0.08 or rms[index] < 0.004:
+                    mouth = "closed"
+                elif energy < 0.28:
+                    mouth = "half"
+                elif energy < 0.58:
+                    mouth = "open"
+                else:
+                    mouth = "wide" if zcr[index] < 0.24 else "open"
+                cues.append({"start": index * 0.02, "end": (index + 1) * 0.02, "mouth": mouth})
+
+        for cue in cues:
+            start = max(0, int(round((float(offset) + cue["start"]) * fps)))
+            end = max(start, int(round((float(offset) + cue["end"]) * fps)) - 1)
+            mouth = cue["mouth"]
+            if timeline and timeline[-1]["mouth"] == mouth and start <= timeline[-1]["endFrame"] + 1:
+                timeline[-1]["endFrame"] = max(timeline[-1]["endFrame"], end)
+            else:
+                timeline.append({"startFrame": start, "endFrame": end, "mouth": mouth})
+
+    while len(timeline) > 200:
+        shortest = min(range(len(timeline)), key=lambda index:
+                       timeline[index]["endFrame"] - timeline[index]["startFrame"])
+        neighbor = shortest - 1 if shortest else 1
+        start, end = sorted((shortest, neighbor))
+        merged = {"startFrame": timeline[start]["startFrame"], "endFrame": timeline[end]["endFrame"],
+                  "mouth": timeline[shortest]["mouth"]}
+        timeline[start:end + 1] = [merged]
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    temporary.write_text(json.dumps({"cache_key": cache_key, "timeline": timeline}), encoding="utf-8")
+    temporary.replace(cache_path)
+    return timeline
 
 
 def audio_sha256(path: Path) -> str:

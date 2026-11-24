@@ -1,0 +1,160 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    html, body { margin: 0; background: transparent; color: #dbeafe; font: 12px system-ui, sans-serif; }
+    canvas { width: 100%; height: 190px; display: block; cursor: crosshair; }
+  </style>
+</head>
+<body>
+<canvas id="timeline" height="190"></canvas>
+<script>
+  const canvas = document.getElementById("timeline");
+  const ctx = canvas.getContext("2d");
+  let args = {}, durations = [], selected = 0, drag = null;
+  const palette = ["#7c3aed", "#0891b2", "#db2777", "#059669", "#d97706", "#6366f1", "#0f766e", "#e11d48"];
+  const send = () => window.parent.postMessage({
+    isStreamlitMessage: true, type: "streamlit:setComponentValue",
+    value: {selected, durations}
+  }, "*");
+  const resize = () => {
+    const ratio = window.devicePixelRatio || 1;
+    const width = Math.max(360, Math.floor(canvas.clientWidth));
+    canvas.width = width * ratio;
+    canvas.height = 190 * ratio;
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    draw();
+  };
+  const draw = () => {
+    const width = canvas.clientWidth, height = 190;
+    ctx.clearRect(0, 0, width, height);
+    const scenes = args.scenes || [];
+    const total = durations.reduce((sum, duration) => sum + duration, 0) || 1;
+    const left = 10, right = width - 10, usable = right - left;
+    const top = 26, barHeight = 48;
+    let cursor = 0;
+    const boundaries = [left];
+    scenes.forEach((scene, index) => {
+      const start = cursor;
+      cursor += durations[index] || 0;
+      const x = left + start / total * usable;
+      const w = Math.max(1, (cursor - start) / total * usable);
+      ctx.fillStyle = palette[index % palette.length];
+      ctx.fillRect(x, top, w, barHeight);
+      if (index === selected) {
+        ctx.strokeStyle = "#f8fafc";
+        ctx.lineWidth = 2;
+        ctx.strokeRect(x + 1, top + 1, Math.max(1, w - 2), barHeight - 2);
+      }
+      if (w > 32) {
+        ctx.fillStyle = "#fff";
+        ctx.font = "600 11px system-ui";
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(x + 4, top, Math.max(0, w - 8), barHeight);
+        ctx.clip();
+        ctx.fillText(`${index + 1}. ${scene.title || "Scene"}`, x + 7, top + 19);
+        ctx.fillStyle = "#e2e8f0";
+        ctx.fillText(`${durations[index].toFixed(1)}s · ${scene.status || "pending"}`, x + 7, top + 37);
+        ctx.restore();
+      }
+      boundaries.push(left + cursor / total * usable);
+      if (index && scene.chapter && scene.chapter !== scenes[index - 1].chapter) {
+        ctx.fillStyle = "#fbbf24";
+        ctx.fillRect(x, top - 7, 2, barHeight + 14);
+        ctx.fillStyle = "#fde68a";
+        ctx.font = "10px system-ui";
+        ctx.fillText(scene.chapter, x + 4, top - 10);
+      }
+    });
+    const wave = args.waveform || [];
+    if (wave.length) {
+      ctx.beginPath();
+      ctx.strokeStyle = "rgba(103,232,249,.8)";
+      ctx.lineWidth = 1;
+      wave.forEach((value, index) => {
+        const x = left + index / Math.max(1, wave.length - 1) * usable;
+        const y = 110 - Math.max(0, Math.min(1, value)) * 27;
+        if (index === 0) ctx.moveTo(x, 110);
+        ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+    }
+    (args.beats || []).forEach((time) => {
+      const x = left + Number(time) / total * usable;
+      if (x >= left && x <= right) {
+        ctx.strokeStyle = "rgba(251,191,36,.75)";
+        ctx.beginPath();
+        ctx.moveTo(x, 80);
+        ctx.lineTo(x, 122);
+        ctx.stroke();
+      }
+    });
+    const ticks = Math.max(2, Math.floor(usable / 100));
+    ctx.fillStyle = "#94a3b8";
+    ctx.font = "10px system-ui";
+    for (let index = 0; index <= ticks; index++) {
+      const x = left + index / ticks * usable;
+      const seconds = total * index / ticks;
+      ctx.fillText(`${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, "0")}`, x, 145);
+    }
+    ctx.fillStyle = "#94a3b8";
+    ctx.fillText("Narration waveform", left, 170);
+    ctx.fillStyle = "#fbbf24";
+    ctx.fillText("Music beats", left + 140, 170);
+    return boundaries;
+  };
+  const onRender = (event) => {
+    const message = event.data;
+    if (!message || message.type !== "streamlit:render") return;
+    args = message.args || {};
+    const fallback = (args.scenes || []).map((scene) => Number(scene.duration) || 2);
+    durations = Array.isArray(args.initial_durations) && args.initial_durations.length === fallback.length
+      ? args.initial_durations.map(Number) : fallback;
+    selected = Math.max(0, Math.min(durations.length - 1, Number(args.initial_selected) || 0));
+    resize();
+  };
+  canvas.addEventListener("pointerdown", (event) => {
+    const bounds = canvas.getBoundingClientRect();
+    const x = event.clientX - bounds.left;
+    const total = durations.reduce((sum, duration) => sum + duration, 0) || 1;
+    const usable = canvas.clientWidth - 20;
+    const boundaries = draw();
+    const near = boundaries.findIndex((boundary, index) => index > 0 && index < boundaries.length - 1
+      && Math.abs(boundary - x) < 9);
+    if (near > 0) {
+      drag = {index: near, originX: x, left: durations[near - 1], right: durations[near]};
+      canvas.setPointerCapture(event.pointerId);
+      return;
+    }
+    const time = Math.max(0, Math.min(total, (x - 10) / usable * total));
+    let elapsed = 0;
+    selected = durations.findIndex((duration) => {
+      elapsed += duration;
+      return time <= elapsed;
+    });
+    selected = Math.max(0, selected);
+    send();
+    draw();
+  });
+  canvas.addEventListener("pointermove", (event) => {
+    if (!drag) return;
+    const delta = (event.clientX - canvas.getBoundingClientRect().left - drag.originX)
+      / Math.max(1, canvas.clientWidth - 20) * durations.reduce((sum, duration) => sum + duration, 0);
+    const left = Math.max(2, Math.min(30, drag.left + delta));
+    const right = Math.max(2, Math.min(30, drag.right - (left - drag.left)));
+    durations[drag.index - 1] = left;
+    durations[drag.index] = right;
+    draw();
+  });
+  canvas.addEventListener("pointerup", () => {
+    if (drag) { drag = null; send(); }
+  });
+  window.addEventListener("message", onRender);
+  window.addEventListener("resize", resize);
+  window.parent.postMessage({isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1}, "*");
+  window.parent.postMessage({isStreamlitMessage: true, type: "streamlit:setFrameHeight", height: 200}, "*");
+</script>
+</body>
+</html>

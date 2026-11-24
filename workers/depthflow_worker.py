@@ -40,6 +40,35 @@ def _ease(value: float) -> float:
     return value * value * (3.0 - 2.0 * value)
 
 
+def _cpu_depth_warp_maps(depth, xx, yy, width: int, height: int, preset: str,
+                         t: float, strength: float):
+    """Build depth-dependent camera maps used by the CPU 3D parallax renderer."""
+    import numpy as np
+
+    oh, ow = xx.shape
+    cx, cy = (ow - 1) / 2.0, (oh - 1) / 2.0
+    phase = 2.0 * math.pi * t
+    zoom = 1.055
+    zx = zy = 0.0
+    if preset == "dolly_in":
+        zoom *= 1.0 + 0.055 * strength * t
+    elif preset == "dolly_out":
+        zoom = 1.055 + 0.055 * strength * (1.0 - t)
+    elif preset == "orbital_left":
+        zx = -0.038 * strength * math.sin(math.pi * t)
+    elif preset == "orbital_right":
+        zx = 0.038 * strength * math.sin(math.pi * t)
+    elif preset == "circle":
+        zx = 0.038 * strength * math.sin(phase)
+        zy = 0.022 * strength * (1.0 - math.cos(phase))
+    elif preset == "vertical_rise":
+        zy = -0.045 * strength * math.sin(math.pi * t)
+    disparity = (depth - 0.5) * (8.0 * strength)
+    map_x = cx + (xx - cx) / zoom - disparity * (0.018 * width * strength + zx * ow)
+    map_y = cy + (yy - cy) / zoom - disparity * (zy * oh)
+    return map_x.astype(np.float32), map_y.astype(np.float32)
+
+
 def _cache_keys(image_hash: str, config: Dict[str, Any], tier: str = "cpu_onnx") -> tuple[str, str]:
     depth_data = {"image": image_hash, "tier": tier, "estimator": "DepthAnythingV2-small"}
     clip_data = {
@@ -211,33 +240,12 @@ def _render_cpu_onnx(image_path: Path, depth_path: Path, output: Path, config: D
     )
     try:
         for frame in range(frames):
-            tau = frame / max(1, frames - 1)
-            t = _ease(tau)
-            phase = 2.0 * math.pi * t
-            zoom = 1.055 * (1.0 - strength * 0.15) if config["preset"] == "dolly_out" else 1.055
-            zx = zy = 0.0
-            if config["preset"] == "dolly_in":
-                zoom *= 1.0 + 0.055 * strength * t
-            elif config["preset"] == "dolly_out":
-                zoom = 1.055 + 0.055 * strength * (1.0 - t)
-            elif config["preset"] == "orbital_left":
-                zx = -0.038 * strength * math.sin(math.pi * t)
-            elif config["preset"] == "orbital_right":
-                zx = 0.038 * strength * math.sin(math.pi * t)
-            elif config["preset"] == "circle":
-                zx = 0.038 * strength * math.sin(phase)
-                zy = 0.022 * strength * (1.0 - math.cos(phase))
-            elif config["preset"] == "vertical_rise":
-                zy = -0.045 * strength * math.sin(math.pi * t)
-
             pad = cv2.resize(source, (ow, oh), interpolation=cv2.INTER_LANCZOS4)
             pad_depth = cv2.resize(depth, (ow, oh), interpolation=cv2.INTER_CUBIC)
-            disparity = (pad_depth - 0.5) * (8.0 * strength)
-            map_x = xx - (cx - zx * ow) - disparity * zx
-            map_y = yy - (cy - zy * oh) - disparity * zy
-            # Foreground moves farther from the frame center; background remains comparatively stable.
-            map_x = cx + (xx - cx) / zoom - disparity * (0.018 * width * strength + zx * ow)
-            map_y = cy + (yy - cy) / zoom - pad_depth * 0.0 - disparity * (zy * oh)
+            t = _ease(frame / max(1, frames - 1))
+            map_x, map_y = _cpu_depth_warp_maps(
+                pad_depth, xx, yy, width, height, config["preset"], t, strength,
+            )
             warped = cv2.remap(pad, map_x, map_y, interpolation=cv2.INTER_LANCZOS4,
                                borderMode=cv2.BORDER_REPLICATE)
 

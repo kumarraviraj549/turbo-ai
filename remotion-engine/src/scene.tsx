@@ -1,9 +1,142 @@
-import React from 'react';
+import React, {Suspense, useMemo} from 'react';
 import {ThreeCanvas} from '@remotion/three';
-import {AbsoluteFill, interpolate, Sequence, spring, useCurrentFrame, useVideoConfig} from 'remotion';
+import {useLoader} from '@react-three/fiber';
+import {AbsoluteFill, interpolate, Sequence, spring, staticFile, useCurrentFrame, useVideoConfig} from 'remotion';
+import {geoEquirectangular, geoInterpolate, geoPath} from 'd3-geo';
+import {feature} from 'topojson-client';
+import type {GeometryCollection, Topology} from 'topojson-specification';
+import {GLTFLoader} from 'three/examples/jsm/loaders/GLTFLoader.js';
+import * as THREE from 'three';
+import worldTopology from 'world-atlas/countries-110m.json';
 import type {ProceduralProps} from './schema';
 
 const background = '#080B15';
+
+const topology = worldTopology as unknown as Topology<{countries: GeometryCollection}>;
+const countries = feature(topology, topology.objects.countries);
+
+const MapRouteAnimator: React.FC<Extract<ProceduralProps, {template: 'map_route_animator'}>> = (props) => {
+  const frame = useCurrentFrame();
+  const {fps, width, height} = useVideoConfig();
+  const projection = useMemo(() => geoEquirectangular()
+    .rotate([-props.mapCenter.longitude, 0])
+    .scale(width / (2 * Math.PI) * props.zoom)
+    .translate([width / 2, height / 2]), [height, props.mapCenter.longitude, props.zoom, width]);
+  const path = useMemo(() => geoPath(projection), [projection]);
+  const cityByName = new Map(props.cities.map((city) => [city.name, city]));
+  return (
+    <AbsoluteFill style={{background: 'radial-gradient(ellipse at 50% 45%, #14233b, #070b16 76%)'}}>
+      <svg viewBox={`0 0 ${width} ${height}`} width="100%" height="100%">
+        <defs>
+          <linearGradient id="route-gradient" x1="0" x2="1">
+            <stop offset="0%" stopColor={props.brand.secondary} />
+            <stop offset="100%" stopColor={props.brand.accent} />
+          </linearGradient>
+          <filter id="route-glow" x="-60%" y="-60%" width="220%" height="220%">
+            <feGaussianBlur stdDeviation="7" result="blur" />
+            <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
+          </filter>
+        </defs>
+        <g>
+          {countries.features.map((country) => {
+            const countryId = String(country.id ?? '');
+            const highlighted = props.highlightCountries.includes(countryId);
+            return (
+              <path key={countryId} d={path(country) || ''}
+                fill={highlighted ? `${props.brand.primary}bb` : '#14243a'}
+                stroke={highlighted ? props.brand.secondary : '#38516f'}
+                strokeWidth={highlighted ? 1.8 : 0.8}
+                vectorEffect="non-scaling-stroke" />
+            );
+          })}
+        </g>
+        {props.routes.map((route, index) => {
+          const from = cityByName.get(route.from);
+          const to = cityByName.get(route.to);
+          if (!from || !to) return null;
+          const interpolateRoute = geoInterpolate(
+            [from.longitude, from.latitude], [to.longitude, to.latitude],
+          );
+          const coordinates = Array.from({length: 65}, (_, step) => interpolateRoute(step / 64));
+          const d = path({type: 'LineString', coordinates}) || '';
+          const progress = interpolate(frame, [index * fps * 0.35, (index * 0.35 + 1.4) * fps],
+            [0, 1], {extrapolateLeft: 'clamp', extrapolateRight: 'clamp'});
+          return (
+            <g key={`${route.from}-${route.to}-${index}`}>
+              <path d={d} fill="none" stroke={props.brand.secondary} strokeWidth={3}
+                opacity={0.28} filter="url(#route-glow)" />
+              <path d={d} fill="none" stroke="url(#route-gradient)" strokeWidth={2.2}
+                strokeDasharray="1" strokeDashoffset={1 - progress} pathLength={1} />
+              {route.label ? (
+                <text x="50%" y="88%" fill="#dbeafe" textAnchor="middle" fontSize={width * 0.018}
+                  fontFamily="Arial, sans-serif">{route.label}</text>
+              ) : null}
+            </g>
+          );
+        })}
+        {props.cities.map((city, index) => {
+          const point = projection([city.longitude, city.latitude]);
+          if (!point) return null;
+          const pulse = 4 + Math.sin(frame / 8 + index) * 1.4;
+          return (
+            <g key={city.name} transform={`translate(${point[0]},${point[1]})`}>
+              <circle r={pulse * 2.2} fill={props.brand.accent} opacity={0.2} />
+              <circle r={pulse} fill={props.brand.secondary} stroke="#fff" strokeWidth={2} />
+              <text x={pulse + 7} y={-pulse - 5} fill="#f8fafc" fontSize={width * 0.014}
+                fontWeight={700} fontFamily="Arial, sans-serif"
+                style={{paintOrder: 'stroke', stroke: '#08111f', strokeWidth: 5}}>{city.name}</text>
+            </g>
+          );
+        })}
+      </svg>
+    </AbsoluteFill>
+  );
+};
+
+const LoadedModel: React.FC<{modelUrl: string}> = ({modelUrl}) => {
+  const frame = useCurrentFrame();
+  const gltf = useLoader(GLTFLoader, staticFile(modelUrl));
+  const loaded = gltf.scene;
+  const geometry = useMemo(() => {
+    if (!loaded) return {center: new THREE.Vector3(), scale: 1};
+    const bounds = new THREE.Box3().setFromObject(loaded);
+    const size = bounds.getSize(new THREE.Vector3());
+    const center = bounds.getCenter(new THREE.Vector3());
+    return {center, scale: 4.4 / Math.max(size.x, size.y, size.z, 0.001)};
+  }, [loaded]);
+  return loaded ? (
+    <group rotation={[0, frame / 100, 0]} scale={geometry.scale}
+      position={[-geometry.center.x * geometry.scale, -geometry.center.y * geometry.scale,
+        -geometry.center.z * geometry.scale]}>
+      <primitive object={loaded} />
+    </group>
+  ) : null;
+};
+
+const ModelShowcase: React.FC<Extract<ProceduralProps, {template: '3d_model_showcase'}>> = (props) => {
+  return (
+    <group>
+      <ambientLight intensity={0.7} />
+      <pointLight position={[-4, 5, 6]} intensity={70} color={props.brand.secondary} />
+      <pointLight position={[5, 2, -2]} intensity={55} color={props.brand.accent} />
+      {props.modelUrl ? (
+        <Suspense fallback={null}><LoadedModel modelUrl={props.modelUrl} /></Suspense>
+      ) : (
+        <group rotation={[0.2, 0.4, 0]}>
+          <mesh scale={[2.4, 2.4, 2.4]}>
+            <icosahedronGeometry args={[1.2, 2]} />
+            <meshPhysicalMaterial color={props.brand.primary} metalness={0.55} roughness={0.2}
+              clearcoat={1} emissive={props.brand.primary} emissiveIntensity={0.12} />
+          </mesh>
+          <mesh position={[0, -2.2, 0]}>
+            <torusGeometry args={[2, 0.045, 10, 64]} />
+            <meshBasicMaterial color={props.brand.secondary} />
+          </mesh>
+        </group>
+      )}
+    </group>
+  );
+};
 
 const BarChart: React.FC<Extract<ProceduralProps, {template: '3d_bar_chart'}>> = (props) => {
   const frame = useCurrentFrame();
@@ -226,7 +359,10 @@ const Overlay: React.FC<{props: ProceduralProps}> = ({props}) => {
         ? props.milestones.map((item) => `${item.year}  ${item.label}`).join('     /     ')
         : props.template === 'process_flow'
           ? props.steps.map((item) => item.label).join('     →     ')
-          : props.template === 'quote_evidence_card' ? props.source : '';
+          : props.template === 'quote_evidence_card' ? props.source
+            : props.template === 'map_route_animator'
+              ? props.routes.map((route) => `${route.from} → ${route.to}`).join('     /     ')
+              : props.template === '3d_model_showcase' ? props.calloutTitle : '';
   const barMax = props.template === '3d_bar_chart'
     ? Math.max(...props.bars.map((bar) => Math.abs(bar.value)), 1)
     : 1;
@@ -286,23 +422,26 @@ export const ProceduralScene: React.FC<ProceduralProps> = (props) => {
     : {position: [0, 0, cameraDistance] as [number, number, number]};
   return (
     <AbsoluteFill style={{background, overflow: 'hidden'}}>
-      <Sequence from={0} durationInFrames={Math.max(1, Math.round(props.durationInSeconds * 30))} layout="none">
-        <ThreeCanvas width={width} height={height} camera={camera} style={{position: 'absolute', inset: 0}}>
-          <ambientLight intensity={1.4} />
-          <directionalLight position={[4, 8, 6]} intensity={3} color="#E4ECFF" />
-          {props.template === '3d_bar_chart' ? <BarChart {...props} /> : null}
-          {props.template === '3d_stat_callout' ? <StatScene {...props} /> : null}
-          {props.template === 'comparison_split' ? <ComparisonScene {...props} /> : null}
-          {props.template === 'timeline_journey'
-            ? <NodeScene count={props.milestones.length} colors={[props.brand.primary, props.brand.secondary]} journey />
-            : null}
-          {props.template === 'process_flow'
-            ? <NodeScene count={props.steps.length} colors={[props.brand.secondary, props.brand.accent]} journey={false} />
-            : null}
-          {props.template === 'quote_evidence_card' ? <EvidenceScene color={props.brand.secondary} /> : null}
-          {props.template === '2d_character_explainer' ? <CharacterExplainer {...props} /> : null}
-        </ThreeCanvas>
-      </Sequence>
+      {props.template === 'map_route_animator' ? <MapRouteAnimator {...props} /> : (
+        <Sequence from={0} durationInFrames={Math.max(1, Math.round(props.durationInSeconds * 30))} layout="none">
+          <ThreeCanvas width={width} height={height} camera={camera} style={{position: 'absolute', inset: 0}}>
+            <ambientLight intensity={1.4} />
+            <directionalLight position={[4, 8, 6]} intensity={3} color="#E4ECFF" />
+            {props.template === '3d_bar_chart' ? <BarChart {...props} /> : null}
+            {props.template === '3d_stat_callout' ? <StatScene {...props} /> : null}
+            {props.template === 'comparison_split' ? <ComparisonScene {...props} /> : null}
+            {props.template === 'timeline_journey'
+              ? <NodeScene count={props.milestones.length} colors={[props.brand.primary, props.brand.secondary]} journey />
+              : null}
+            {props.template === 'process_flow'
+              ? <NodeScene count={props.steps.length} colors={[props.brand.secondary, props.brand.accent]} journey={false} />
+              : null}
+            {props.template === 'quote_evidence_card' ? <EvidenceScene color={props.brand.secondary} /> : null}
+            {props.template === '2d_character_explainer' ? <CharacterExplainer {...props} /> : null}
+            {props.template === '3d_model_showcase' ? <ModelShowcase {...props} /> : null}
+          </ThreeCanvas>
+        </Sequence>
+      )}
       {props.template === 'kinetic_hook_title' ? <HookTitle {...props} /> : null}
       <Overlay props={props} />
     </AbsoluteFill>

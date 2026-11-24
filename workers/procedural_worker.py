@@ -83,12 +83,14 @@ def run(config: Dict[str, Any]) -> Dict[str, Any]:
     scene_number = max(1, int(config.get("scene_index", 1)))
     props_path = scene_dir / f"scene_{scene_number:02d}_props.json"
     _write_json(props_path, props)
+    public_dir = str(config.get("public_dir", "")).strip()
+    public_args = ["--public-dir", public_dir] if public_dir and Path(public_dir).is_dir() else []
 
     if mode == "still":
         output = Path(config["output"])
         output.parent.mkdir(parents=True, exist_ok=True)
         frame = max(0, int(config.get("frame", 0)))
-        _run_cli(["still", ENTRY, COMPOSITION, str(output), "--props", str(props_path),
+        _run_cli(["still", ENTRY, COMPOSITION, str(output), "--props", str(props_path), *public_args,
                   "--frame", str(frame), "--log", "error"], float(config.get("timeout", 600)))
         if not output.is_file() or output.stat().st_size == 0:
             raise RuntimeError("Remotion completed without creating a preview image.")
@@ -124,7 +126,7 @@ def run(config: Dict[str, Any]) -> Dict[str, Any]:
     timeout = float(config.get("timeout", max(1800, float(config["duration"]) * 120)))
     _run_cli(
         ["render", ENTRY, COMPOSITION, str(temporary), "--props", str(props_path),
-         "--log", "error", "--concurrency", "2"],
+         *public_args, "--log", "error", "--concurrency", "2"],
         timeout,
     )
     if not temporary.is_file() or temporary.stat().st_size == 0:

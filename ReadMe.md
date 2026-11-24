@@ -195,6 +195,38 @@ milestones, two to eight process steps, up to five metrics per comparison side, 
 explainer props support five expressions and an optional frame-based mouth-state timeline; this is a graphic
 animation aid, not automatic audio-driven lip-sync.
 
+## Local production tools and optional workers
+
+The Storyboard motion-engine menu also offers **Manim CE safe math templates** and **Blender headless 3D
+flythrough**. Manim runs only its three built-in math templates and accepts bounded parameters; Blender runs a
+bundled flythrough scene against an optional project-local GLB/GLTF model. Neither worker executes generated scripts.
+Both outputs pass through the usual scene captions, overlays, grading, and final assembly. Install Manim and the
+optional image/search packages with
+`.\venv\Scripts\python.exe -m pip install -r requirements-pro-optional.txt`; install Blender separately and put
+`blender.exe` on `PATH` or set `BLENDER_EXECUTABLE` to its full path. Missing optional engines fall back to the
+built-in renderer.
+
+**Generate Multi-Language Dub Pack** creates per-scene translations, fitted voice audio, subtitles, and a mastered
+audio pack without re-rendering the video. English defaults to Kokoro, Hindi to Sarvam when configured, and the other
+listed languages can use a local Qwen3-TTS bridge. Edge is draft-only and requires an explicit acknowledgment.
+Chatterbox requires both the project's local reference WAV and the Audio-page permission checkbox. The optional
+loopback-only REST bridges are selected with `QWEN3_TTS_URL`, `DIA_TTS_URL`, or `CHATTERBOX_URL`; local music and
+foley bridges use `ACESTEP_URL` and `MMAUDIO_URL`. Each bridge must provide its own compatible `/generate` endpoint;
+no model weights or hosted-service keys are bundled.
+
+The **Local B-Roll Vault** indexes user-selected media under `output/vault/` by content hash and searches its local
+tags before stock providers. Keyword search works without extra packages. Semantic image matching is opt-in and
+requires a user-supplied local OpenCLIP checkpoint configured with `TUBEFORGE_VAULT_CLIP_CHECKPOINT` (and optionally
+`TUBEFORGE_VAULT_CLIP_ARCH`); no checkpoint is downloaded automatically. The **Thumbnail Lab** creates a cached
+168×94 feed preview, with optional rembg cutout/glow processing.
+
+The **Nightly Batch Render Queue** is persistent but only starts when explicitly requested. It resumes interrupted
+items as pending, renders projects sequentially, and can optionally upload completed videos as private YouTube
+drafts using existing local OAuth authorization. Optional completion notifications use
+`TUBEFORGE_BATCH_WEBHOOK_URL`; Telegram also requires `TUBEFORGE_TELEGRAM_CHAT_ID`. Webhook URLs must use HTTPS.
+ComfyUI named profiles still require a workflow exported from the user's ComfyUI installation and locally installed
+models; TubeForge does not bundle model weights.
+
 ## Feature-by-feature guide
 
 The app's navigation is **Dashboard**, **Create**, **Story**, **Storyboard**, **Timeline & Look**, **Audio**,

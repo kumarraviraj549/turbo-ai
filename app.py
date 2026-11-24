@@ -18,10 +18,20 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional
 
+import streamlit as st
+
+try:
+    from streamlit.runtime.scriptrunner import get_script_run_ctx
+except ImportError:
+    from streamlit.runtime.scriptrunner_utils.script_run_context import get_script_run_ctx
+
+
+if get_script_run_ctx(suppress_warning=True) is None:
+    raise SystemExit(0)
+
 import edge_tts
 import pandas as pd
 import requests
-import streamlit as st
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 from pydantic import BaseModel, Field
 

@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "license": "MIT",
+  "note": "Profiles target user-installed ComfyUI models and exported API workflows; no model weights are bundled.",
+  "presets": {
+    "wan22_video": {
+      "label": "Wan 2.2 video",
+      "kind": "video",
+      "workflow_required": true,
+      "model_family": "Wan 2.2"
+    },
+    "kandinsky60_video": {
+      "label": "Kandinsky 6.0 video",
+      "kind": "video",
+      "workflow_required": true,
+      "model_family": "Kandinsky 6.0"
+    },
+    "ltx25_video": {
+      "label": "LTX-2.5 video",
+      "kind": "video",
+      "workflow_required": true,
+      "model_family": "LTX-2.5"
+    },
+    "flux_kontext_edit": {
+      "label": "FLUX Kontext surgical edit",
+      "kind": "image_edit",
+      "workflow_required": true,
+      "model_family": "FLUX Kontext"
+    },
+    "qwen_image_edit": {
+      "label": "Qwen-Image-Edit surgical edit",
+      "kind": "image_edit",
+      "workflow_required": true,
+      "model_family": "Qwen-Image-Edit"
+    },
+    "musetalk_lipsync": {
+      "label": "MuseTalk hero lip-sync",
+      "kind": "lipsync",
+      "workflow_required": true,
+      "model_family": "MuseTalk"
+    },
+    "latentsync16_lipsync": {
+      "label": "LatentSync 1.6 hero lip-sync",
+      "kind": "lipsync",
+      "workflow_required": true,
+      "model_family": "LatentSync 1.6"
+    }
+  }
+}
