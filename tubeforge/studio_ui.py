@@ -128,13 +128,6 @@ def _display_brand_badge(channel_name: str, logo_source: Optional[Any] = None) -
         f"</div>",
         unsafe_allow_html=True
     )
-    if s.get("youtube_playlist_title", "").strip():
-        playlist_id = youtube_upload.insert_playlist(
-            [video_id], client, token,
-            s["youtube_playlist_title"].strip(),
-            description=(plan.youtube_description if plan else "")[:5000],
-        )
-        st.success(f"Added private draft to playlist: {playlist_id}")
 
 
 # ---------------------------------------------------------------------------------------------- helpers
@@ -2050,6 +2043,16 @@ def page_render() -> None:
                         publish_at=s.get("youtube_publish_at", ""),
                     )
                     st.success(f"Uploaded as private draft: https://www.youtube.com/watch?v={video_id}")
+                    playlist_title = s.get("youtube_playlist_title", "").strip()
+                    if playlist_title:
+                        try:
+                            playlist_id = youtube_upload.insert_playlist(
+                                [video_id], client, token, playlist_title,
+                                description=(plan.youtube_description if plan else "")[:5000],
+                            )
+                            st.success(f"Added private draft to playlist: {playlist_id}")
+                        except Exception as exc:  # noqa: BLE001
+                            st.error(f"Video uploaded, but adding it to the playlist failed: {exc}")
                 except Exception as exc:  # noqa: BLE001
                     st.error(f"Private YouTube upload failed: {exc}")
         st.divider()
